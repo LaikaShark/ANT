@@ -1,0 +1,98 @@
+// ant diff — compare working tree against HEAD chamber
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <streq> AS STREQ;
+IMPORTF <length> AS LENGTH;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <to_string> AS TO_STRING;
+
+// read HEAD → branch → chamber id
+READ ".ant/HEAD" AS TNAME;
+TRIM [TNAME, NULL] TNAME;
+TEXT ".ant/refs/" TNAME AS REF_PATH;
+READ REF_PATH AS CID;
+TRIM [CID, NULL] CID;
+
+// check if any chambers exist
+PARSE [CID, NULL] CID_NUM;
+GT [CID_NUM, 0] HAS_CHAMBER;
+CLONE HAS_CHAMBER AS HC;
+BRANCH(!HC) {
+    PRINT no chambers yet;
+    THIS.DIE();
+}
+
+// read chamber manifest
+TEXT ".ant/chambers/" CID "/files" AS MPATH;
+READ MPATH AS MANIFEST;
+TRIM [MANIFEST, NULL] MANIFEST;
+
+TEXT "\n" AS NL;
+SPLIT [MANIFEST, NL] FNAMES;
+IMPORT NUMBER 0 AS IDX;
+
+~ATH(FNAMES) {
+    BIFURCATE FNAMES[FNAME, FNAMES];
+    LENGTH [FNAME, NULL] FLEN;
+    BRANCH(FLEN) {
+        // read old blob from chamber
+        TO_STRING [IDX, NULL] IDX_S;
+        TEXT ".ant/chambers/" CID "/" IDX_S AS BPATH;
+        READ BPATH AS OLD;
+
+        // read current working tree file
+        READ FNAME AS NEW;
+
+        // compare whole content
+        STREQ [OLD, NEW] SAME;
+        CLONE SAME AS SC;
+        BRANCH(!SC) {
+            // files differ — show line-by-line diff
+            PRINT --- a/$FNAME;
+            PRINT +++ b/$FNAME;
+
+            SPLIT [OLD, NL] OLINES;
+            SPLIT [NEW, NL] NLINES;
+
+            // parallel walk: compare lines in lockstep
+            ~ATH(OLINES) {
+                BIFURCATE OLINES[OL, OLINES];
+                LENGTH [OL, NULL] OLL;
+                BRANCH(OLL) {
+                    CLONE NLINES AS NC;
+                    BRANCH(NC) {
+                        BIFURCATE NLINES[NLN, NLINES];
+                        STREQ [OL, NLN] LM;
+                        CLONE LM AS LMC;
+                        BRANCH(LMC) {
+                            // lines match
+                        }
+                        ELSE {
+                            PRINT - $OL;
+                            PRINT + $NLN;
+                        }
+                    }
+                    ELSE {
+                        PRINT - $OL;
+                    }
+                }
+            }
+
+            // remaining new lines are additions
+            ~ATH(NLINES) {
+                BIFURCATE NLINES[NLN, NLINES];
+                LENGTH [NLN, NULL] NLL;
+                BRANCH(NLL) {
+                    PRINT + $NLN;
+                }
+            }
+        }
+
+        ADD [IDX, 1] IDX;
+    }
+}
+
+THIS.DIE();

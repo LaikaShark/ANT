@@ -1,0 +1,264 @@
+// ant splice <branch> — merge another tunnel into current
+// file-level three-way merge with conflict markers
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <streq> AS STREQ;
+IMPORTF <concat> AS CONCAT;
+IMPORTF <length> AS LENGTH;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <to_string> AS TO_STRING;
+IMPORTF "ant_find.ath" AS ANT_FIND;
+
+BIFURCATE ARGS[T_BRANCH, JUNK];
+
+// read our tip
+READ ".ant/HEAD" AS O_BRANCH;
+TRIM [O_BRANCH, NULL] O_BRANCH;
+TEXT ".ant/refs/" O_BRANCH AS O_REF;
+READ O_REF AS O_CID;
+TRIM [O_CID, NULL] O_CID;
+
+// read their tip
+TEXT ".ant/refs/" T_BRANCH AS T_REF;
+READ T_REF AS T_CID;
+TRIM [T_CID, NULL] T_CID;
+
+// already up to date?
+STREQ [O_CID, T_CID] SAME;
+CLONE SAME AS SC;
+BRANCH(SC) {
+    PRINT already up to date;
+    THIS.DIE();
+}
+
+// --- find common ancestor ---
+TEXT "" O_CID AS OW;
+TEXT "" T_CID AS TW;
+PARSE [OW, NULL] ON;
+PARSE [TW, NULL] TN;
+
+IMPORT ALIVE WALKING;
+STREQ [OW, TW] WS;
+CLONE WS AS WSC;
+BRANCH(WSC) {
+    WALKING.DIE();
+}
+
+~ATH(WALKING) {
+    GT [ON, TN] O_HI;
+    CLONE O_HI AS OHC;
+    BRANCH(OHC) {
+        TEXT ".ant/chambers/" OW "/parent" AS PP;
+        READ PP AS P;
+        TRIM [P, NULL] P;
+        TEXT "" P AS OW;
+        PARSE [OW, NULL] ON;
+    }
+    ELSE {
+        TEXT ".ant/chambers/" TW "/parent" AS PP;
+        READ PP AS P;
+        TRIM [P, NULL] P;
+        TEXT "" P AS TW;
+        PARSE [TW, NULL] TN;
+    }
+
+    STREQ [OW, TW] NS;
+    CLONE NS AS NSC;
+    BRANCH(NSC) {
+        WALKING.DIE();
+    }
+}
+
+TEXT "" OW AS BASE_CID;
+
+// --- allocate merge chamber ---
+READ ".ant/next_id" AS ID_STR;
+TRIM [ID_STR, NULL] ID_STR;
+PARSE [ID_STR, NULL] ID_NUM;
+ADD [ID_NUM, 1] NEXT_NUM;
+TO_STRING [NEXT_NUM, NULL] NEXT_STR;
+WRITE NEXT_STR TO ".ant/next_id" AS V1;
+
+TEXT ".ant/chambers/" ID_STR AS CDIR;
+MKDIR CDIR;
+TEXT CDIR "/parent" AS PPATH;
+WRITE O_CID TO PPATH AS V2;
+TEXT "splice tunnel '" T_BRANCH "'" AS CMSG;
+TEXT CDIR "/message" AS MPATH;
+WRITE CMSG TO MPATH AS V3;
+
+TEXT "\n" AS NL;
+
+// --- merge OURS files ---
+TEXT ".ant/chambers/" O_CID "/files" AS O_MPATH;
+READ O_MPATH AS O_MAN;
+TRIM [O_MAN, NULL] O_MAN;
+SPLIT [O_MAN, NL] O_FILES;
+IMPORT NUMBER 0 AS OIDX;
+IMPORT NUMBER 0 AS WIDX;
+TEXT "" AS MANIFEST;
+IMPORT ALIVE CONFLICTS;
+CONFLICTS.DIE();
+
+~ATH(O_FILES) {
+    BIFURCATE O_FILES[FNAME, O_FILES];
+    CLONE FNAME AS FNC;
+    BRANCH(FNC) {
+        // read our blob
+        TO_STRING [OIDX, NULL] OIDX_S;
+        TEXT ".ant/chambers/" O_CID "/" OIDX_S AS OBP;
+        READ OBP AS O_CON;
+
+        // default merged = ours
+        TEXT "" O_CON AS MERGED;
+
+        // look up in theirs
+        ANT_FIND [FNAME, T_CID] T_CON;
+
+        CLONE T_CON AS TCC;
+        BRANCH(TCC) {
+            // theirs has this file — compare
+            STREQ [O_CON, T_CON] OT_EQ;
+            CLONE OT_EQ AS OTE;
+            BRANCH(!OTE) {
+                // different — check base
+                ANT_FIND [FNAME, BASE_CID] B_CON;
+                CLONE B_CON AS BCC;
+                BRANCH(BCC) {
+                    STREQ [B_CON, O_CON] BO_EQ;
+                    CLONE BO_EQ AS BOE;
+                    BRANCH(BOE) {
+                        // ours == base, theirs changed → take theirs
+                        TEXT "" T_CON AS MERGED;
+                    }
+                    ELSE {
+                        STREQ [B_CON, T_CON] BT_EQ;
+                        CLONE BT_EQ AS BTE;
+                        BRANCH(BTE) {
+                            // theirs == base, ours changed → keep ours
+                        }
+                        ELSE {
+                            // both changed → conflict
+                            TEXT "<<<<<<< " O_BRANCH AS CM;
+                            CONCAT [CM, NL] CM;
+                            CONCAT [CM, O_CON] CM;
+                            TEXT "=======" AS SEP;
+                            CONCAT [CM, SEP] CM;
+                            CONCAT [CM, NL] CM;
+                            CONCAT [CM, T_CON] CM;
+                            TEXT ">>>>>>> " T_BRANCH AS MK;
+                            CONCAT [CM, MK] CM;
+                            CONCAT [CM, NL] CM;
+                            TEXT "" CM AS MERGED;
+                            IMPORT ALIVE CMARK;
+                            BIFURCATE [CMARK, NULL] CONFLICTS;
+                            PRINT CONFLICT: $FNAME;
+                        }
+                    }
+                }
+                ELSE {
+                    // no base → conflict
+                    TEXT "<<<<<<< " O_BRANCH AS CM;
+                    CONCAT [CM, NL] CM;
+                    CONCAT [CM, O_CON] CM;
+                    TEXT "=======" AS SEP;
+                    CONCAT [CM, SEP] CM;
+                    CONCAT [CM, NL] CM;
+                    CONCAT [CM, T_CON] CM;
+                    TEXT ">>>>>>> " T_BRANCH AS MK;
+                    CONCAT [CM, MK] CM;
+                    CONCAT [CM, NL] CM;
+                    TEXT "" CM AS MERGED;
+                    IMPORT ALIVE CMARK;
+                    BIFURCATE [CMARK, NULL] CONFLICTS;
+                    PRINT CONFLICT: $FNAME;
+                }
+            }
+        }
+
+        // write merged blob
+        TO_STRING [WIDX, NULL] WS;
+        TEXT CDIR "/" WS AS WBP;
+        WRITE MERGED TO WBP AS V4;
+
+        CLONE MANIFEST AS MMC;
+        BRANCH(MMC) {
+            CONCAT [MANIFEST, NL] MANIFEST;
+        }
+        CONCAT [MANIFEST, FNAME] MANIFEST;
+        ADD [WIDX, 1] WIDX;
+        ADD [OIDX, 1] OIDX;
+    }
+}
+
+// --- add THEIRS-only files ---
+TEXT ".ant/chambers/" T_CID "/files" AS T_MPATH;
+READ T_MPATH AS T_MAN;
+TRIM [T_MAN, NULL] T_MAN;
+SPLIT [T_MAN, NL] T_FILES;
+IMPORT NUMBER 0 AS TIDX;
+
+~ATH(T_FILES) {
+    BIFURCATE T_FILES[TFNAME, T_FILES];
+    CLONE TFNAME AS TFC;
+    BRANCH(TFC) {
+        // check if already in ours
+        ANT_FIND [TFNAME, O_CID] ALREADY;
+        CLONE ALREADY AS ALC;
+        BRANCH(!ALC) {
+            // not in ours → add from theirs
+            TO_STRING [TIDX, NULL] TIDX_S;
+            TEXT ".ant/chambers/" T_CID "/" TIDX_S AS TBP;
+            READ TBP AS TCON;
+
+            TO_STRING [WIDX, NULL] WS;
+            TEXT CDIR "/" WS AS WBP;
+            WRITE TCON TO WBP AS V7;
+
+            CLONE MANIFEST AS MMC;
+            BRANCH(MMC) {
+                CONCAT [MANIFEST, NL] MANIFEST;
+            }
+            CONCAT [MANIFEST, TFNAME] MANIFEST;
+            ADD [WIDX, 1] WIDX;
+        }
+        ADD [TIDX, 1] TIDX;
+    }
+}
+
+// --- finalize ---
+TEXT CDIR "/files" AS FPATH;
+WRITE MANIFEST TO FPATH AS V8;
+WRITE ID_STR TO O_REF AS V9;
+
+// clear forage
+TEXT "" AS EMPTY;
+WRITE EMPTY TO ".ant/forage" AS V10;
+
+// restore working tree
+SPLIT [MANIFEST, NL] RFILES;
+IMPORT NUMBER 0 AS RIDX;
+~ATH(RFILES) {
+    BIFURCATE RFILES[RFNAME, RFILES];
+    CLONE RFNAME AS RFC;
+    BRANCH(RFC) {
+        TO_STRING [RIDX, NULL] RIDX_S;
+        TEXT CDIR "/" RIDX_S AS RBP;
+        READ RBP AS RCON;
+        WRITE RCON TO RFNAME AS V11;
+        ADD [RIDX, 1] RIDX;
+    }
+}
+
+CLONE CONFLICTS AS CFC;
+BRANCH(CFC) {
+    PRINT splice complete with conflicts — resolve and dig;
+}
+ELSE {
+    PRINT [$O_BRANCH $ID_STR] $CMSG;
+}
+
+THIS.DIE();

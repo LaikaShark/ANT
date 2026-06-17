@@ -1,0 +1,52 @@
+// ant collect <filename> — bring a file to the forage pile
+// ARGS = [FILENAME, _]
+
+IMPORTF <streq> AS STREQ;
+IMPORTF <concat> AS CONCAT;
+IMPORTF <split> AS SPLIT;
+IMPORTF <trim> AS TRIM;
+IMPORTF <length> AS LENGTH;
+
+BIFURCATE ARGS[FNAME, JUNK];
+
+// read current forage pile
+READ ".ant/forage" AS PILE;
+TRIM [PILE, NULL] PILE;
+
+// check if already collected: split by newline, walk entries
+TEXT "\n" AS NL;
+SPLIT [PILE, NL] LINES;
+
+// scan for existing entry (compose to rebind; IMPORT is first-time-only)
+IMPORT ALIVE FOUND;
+FOUND.DIE();
+
+~ATH(LINES) {
+    BIFURCATE LINES[LINE, LINES];
+    LENGTH [LINE, NULL] LLEN;
+    BRANCH(LLEN) {
+        STREQ [LINE, FNAME] EQ;
+        BRANCH(EQ) {
+            IMPORT ALIVE MARKER;
+            BIFURCATE [MARKER, NULL] FOUND;
+        }
+    }
+}
+
+// if not already collected, append
+CLONE FOUND AS FCHECK;
+BRANCH(FCHECK) {
+    PRINT already collected: $FNAME;
+}
+ELSE {
+    // build new pile: old content + newline + filename
+    CLONE PILE AS PCHECK;
+    BRANCH(PCHECK) {
+        CONCAT [PILE, NL] PILE;
+    }
+    CONCAT [PILE, FNAME] PILE;
+    WRITE PILE TO ".ant/forage" AS V;
+    PRINT collected: $FNAME;
+}
+
+THIS.DIE();

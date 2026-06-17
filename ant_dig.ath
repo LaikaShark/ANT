@@ -1,0 +1,92 @@
+// ant dig <message> — store foraged files into a new chamber
+// ARGS = [MESSAGE, _]
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <concat> AS CONCAT;
+IMPORTF <length> AS LENGTH;
+IMPORTF <add> AS ADD;
+IMPORTF <to_string> AS TO_STRING;
+IMPORTF <parse> AS PARSE;
+IMPORTF <now> AS NOW;
+
+BIFURCATE ARGS[MSG, JUNK];
+
+// read current tunnel and its ref
+READ ".ant/HEAD" AS TNAME;
+TRIM [TNAME, NULL] TNAME;
+TEXT ".ant/refs/" TNAME AS REF_PATH;
+READ REF_PATH AS PARENT;
+TRIM [PARENT, NULL] PARENT;
+
+// read and bump chamber id counter
+READ ".ant/next_id" AS ID_STR;
+TRIM [ID_STR, NULL] ID_STR;
+PARSE [ID_STR, NULL] ID_NUM;
+ADD [ID_NUM, 1] NEXT_NUM;
+TO_STRING [NEXT_NUM, NULL] NEXT_STR;
+WRITE NEXT_STR TO ".ant/next_id" AS V1;
+
+// read forage pile (list of collected filenames)
+READ ".ant/forage" AS PILE;
+TRIM [PILE, NULL] PILE;
+
+// abort if forage pile empty
+CLONE PILE AS PCHECK;
+BRANCH(!PCHECK) {
+    PRINT nothing collected;
+    THIS.DIE();
+}
+
+// dig new chamber
+TEXT ".ant/chambers/" ID_STR AS CDIR;
+MKDIR CDIR;
+
+// write metadata
+TEXT CDIR "/parent" AS PPATH;
+WRITE PARENT TO PPATH AS V2;
+TEXT CDIR "/message" AS MPATH;
+WRITE MSG TO MPATH AS V3;
+
+// store each collected file into the chamber
+TEXT "\n" AS NL;
+SPLIT [PILE, NL] FILES;
+IMPORT NUMBER 0 AS IDX;
+TEXT "" AS MANIFEST;
+
+~ATH(FILES) {
+    BIFURCATE FILES[FNAME, FILES];
+    LENGTH [FNAME, NULL] FLEN;
+    BRANCH(FLEN) {
+        // read working-tree file
+        READ FNAME AS CONTENT;
+
+        // write blob: .ant/chambers/<id>/<idx>
+        TO_STRING [IDX, NULL] IDX_S;
+        TEXT CDIR "/" IDX_S AS BPATH;
+        WRITE CONTENT TO BPATH AS V4;
+
+        // add to manifest
+        CLONE MANIFEST AS MCHECK;
+        BRANCH(MCHECK) {
+            CONCAT [MANIFEST, NL] MANIFEST;
+        }
+        CONCAT [MANIFEST, FNAME] MANIFEST;
+
+        ADD [IDX, 1] IDX;
+    }
+}
+
+// write manifest (filename list matching blob indices)
+TEXT CDIR "/files" AS FPATH;
+WRITE MANIFEST TO FPATH AS V5;
+
+// update tunnel ref to new chamber id
+WRITE ID_STR TO REF_PATH AS V6;
+
+// clear forage pile
+TEXT "" AS EMPTY;
+WRITE EMPTY TO ".ant/forage" AS V7;
+
+PRINT [$TNAME $ID_STR] $MSG;
+THIS.DIE();

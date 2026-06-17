@@ -1,0 +1,58 @@
+// ant tunnel <name> — burrow to a different branch
+// switches HEAD and restores working tree from target chamber
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <length> AS LENGTH;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <to_string> AS TO_STRING;
+
+BIFURCATE ARGS[NAME, JUNK];
+
+// verify branch exists
+TEXT ".ant/refs/" NAME AS REF_PATH;
+EXISTS REF_PATH AS RE;
+CLONE RE AS REC;
+BRANCH(!REC) {
+    PRINT unknown tunnel: $NAME;
+    THIS.DIE();
+}
+
+// read target branch ref
+READ REF_PATH AS CID;
+TRIM [CID, NULL] CID;
+
+// update HEAD
+WRITE NAME TO ".ant/HEAD" AS V1;
+
+// restore working tree from target chamber (if any chambers exist)
+PARSE [CID, NULL] CID_NUM;
+GT [CID_NUM, 0] HAS_CHAMBER;
+CLONE HAS_CHAMBER AS HC;
+BRANCH(HC) {
+    // read manifest and restore files
+    TEXT ".ant/chambers/" CID "/files" AS MPATH;
+    READ MPATH AS MANIFEST;
+    TRIM [MANIFEST, NULL] MANIFEST;
+
+    TEXT "\n" AS NL;
+    SPLIT [MANIFEST, NL] FNAMES;
+    IMPORT NUMBER 0 AS IDX;
+
+    ~ATH(FNAMES) {
+        BIFURCATE FNAMES[FNAME, FNAMES];
+        LENGTH [FNAME, NULL] FLEN;
+        BRANCH(FLEN) {
+            TO_STRING [IDX, NULL] IDX_S;
+            TEXT ".ant/chambers/" CID "/" IDX_S AS BPATH;
+            READ BPATH AS CONTENT;
+            WRITE CONTENT TO FNAME AS V2;
+            ADD [IDX, 1] IDX;
+        }
+    }
+}
+
+PRINT tunneled to: $NAME;
+THIS.DIE();

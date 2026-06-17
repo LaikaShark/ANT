@@ -1,0 +1,26 @@
+// ant hatch — found a new colony
+
+EXISTS ".ant" AS ALREADY;
+CLONE ALREADY AS AC;
+BRANCH(AC) {
+    PRINT colony already exists;
+    THIS.DIE();
+}
+
+MKDIR ".ant";
+MKDIR ".ant/refs";
+MKDIR ".ant/chambers";
+
+TEXT "main" AS BNAME;
+WRITE BNAME TO ".ant/HEAD" AS V1;
+TEXT "0" AS ZERO;
+WRITE ZERO TO ".ant/refs/main" AS V2;
+
+// forage pile starts empty; next chamber id is 1 (0 means "no parent")
+TEXT "" AS EMPTY;
+WRITE EMPTY TO ".ant/forage" AS V3;
+TEXT "1" AS ONE;
+WRITE ONE TO ".ant/next_id" AS V4;
+
+PRINT colony hatched;
+THIS.DIE();

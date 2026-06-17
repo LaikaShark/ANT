@@ -1,0 +1,121 @@
+// ant status — show colony state
+// compares forage pile and working tree against HEAD chamber
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <streq> AS STREQ;
+IMPORTF <concat> AS CONCAT;
+IMPORTF <length> AS LENGTH;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <to_string> AS TO_STRING;
+
+// read current tunnel
+READ ".ant/HEAD" AS TNAME;
+TRIM [TNAME, NULL] TNAME;
+TEXT ".ant/refs/" TNAME AS REF_PATH;
+READ REF_PATH AS CID;
+TRIM [CID, NULL] CID;
+
+PRINT on tunnel: $TNAME;
+
+// read forage pile
+READ ".ant/forage" AS PILE;
+TRIM [PILE, NULL] PILE;
+
+// check if any chambers exist
+PARSE [CID, NULL] CID_NUM;
+GT [CID_NUM, 0] HAS_CHAMBER;
+CLONE HAS_CHAMBER AS HC;
+BRANCH(!HC) {
+    // no chambers yet — just show forage
+    CLONE PILE AS PC;
+    BRANCH(PC) {
+        PRINT ;
+        PRINT collected (ready to dig):;
+        TEXT "\n" AS NL;
+        SPLIT [PILE, NL] PFILES;
+        ~ATH(PFILES) {
+            BIFURCATE PFILES[PF, PFILES];
+            CLONE PF AS PFC;
+            BRANCH(PFC) {
+                PRINT   $PF;
+            }
+        }
+    }
+    ELSE {
+        PRINT nothing collected, no chambers;
+    }
+    THIS.DIE();
+}
+
+// read HEAD chamber manifest
+TEXT ".ant/chambers/" CID "/files" AS MPATH;
+READ MPATH AS MANIFEST;
+TRIM [MANIFEST, NULL] MANIFEST;
+
+TEXT "\n" AS NL;
+
+// --- show forage pile ---
+CLONE PILE AS PC;
+BRANCH(PC) {
+    PRINT ;
+    PRINT collected (ready to dig):;
+    SPLIT [PILE, NL] PFILES;
+    ~ATH(PFILES) {
+        BIFURCATE PFILES[PF, PFILES];
+        CLONE PF AS PFC;
+        BRANCH(PFC) {
+            PRINT   $PF;
+        }
+    }
+}
+
+// --- compare tracked files against working tree ---
+SPLIT [MANIFEST, NL] MFILES;
+IMPORT NUMBER 0 AS IDX;
+IMPORT ALIVE HAS_MOD;
+HAS_MOD.DIE();
+
+~ATH(MFILES) {
+    BIFURCATE MFILES[FNAME, MFILES];
+    CLONE FNAME AS FNC;
+    BRANCH(FNC) {
+        // read chamber blob
+        TO_STRING [IDX, NULL] IDX_S;
+        TEXT ".ant/chambers/" CID "/" IDX_S AS BPATH;
+        READ BPATH AS OLD;
+
+        // read working tree
+        READ FNAME AS CUR;
+
+        STREQ [OLD, CUR] SAME;
+        CLONE SAME AS SC;
+        BRANCH(!SC) {
+            // first modification? print header
+            CLONE HAS_MOD AS HMC;
+            BRANCH(!HMC) {
+                PRINT ;
+                PRINT modified (working tree differs from chamber $CID):;
+                IMPORT ALIVE MMARK;
+                BIFURCATE [MMARK, NULL] HAS_MOD;
+            }
+            PRINT   $FNAME;
+        }
+
+        ADD [IDX, 1] IDX;
+    }
+}
+
+// --- summary if clean ---
+CLONE HAS_MOD AS HMC2;
+CLONE PILE AS PC2;
+BRANCH(!HMC2) {
+    BRANCH(!PC2) {
+        PRINT ;
+        PRINT working tree clean;
+    }
+}
+
+THIS.DIE();

@@ -1,0 +1,128 @@
+// ant — CLI dispatcher for ~ANT colony version control
+// usage: ant <command> [args...]
+
+IMPORTF "ant_hatch.ath" AS ANT_HATCH;
+IMPORTF "ant_collect.ath" AS ANT_COLLECT;
+IMPORTF "ant_dig.ath" AS ANT_DIG;
+IMPORTF "ant_log.ath" AS ANT_LOG;
+IMPORTF "ant_fission.ath" AS ANT_FISSION;
+IMPORTF "ant_tunnel.ath" AS ANT_TUNNEL;
+IMPORTF "ant_diff.ath" AS ANT_DIFF;
+IMPORTF "ant_splice.ath" AS ANT_SPLICE;
+IMPORTF "ant_transplant.ath" AS ANT_TRANSPLANT;
+IMPORTF "ant_status.ath" AS ANT_STATUS;
+IMPORTF "ant_deliver.ath" AS ANT_DELIVER;
+IMPORTF "ant_gather.ath" AS ANT_GATHER;
+IMPORTF <streq> AS STREQ;
+
+// no args → print usage
+BRANCH(ARGS) {
+    // has args
+}
+ELSE {
+    PRINT usage: ant <command> [args];
+    PRINT commands: hatch collect dig log fission tunnel diff splice transplant status deliver gather;
+    THIS.DIE();
+}
+
+BIFURCATE ARGS[CMD, REST];
+
+TEXT "hatch" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    IMPORT ANY A;
+    ANT_HATCH [REST, A] R;
+    THIS.DIE();
+}
+
+TEXT "collect" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    BIFURCATE REST[ARG1, MORE];
+    ANT_COLLECT [ARG1, MORE] R;
+    THIS.DIE();
+}
+
+TEXT "dig" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    BIFURCATE REST[ARG1, MORE];
+    ANT_DIG [ARG1, MORE] R;
+    THIS.DIE();
+}
+
+TEXT "log" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    IMPORT ANY A;
+    ANT_LOG [REST, A] R;
+    THIS.DIE();
+}
+
+TEXT "fission" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    BIFURCATE REST[ARG1, MORE];
+    ANT_FISSION [ARG1, MORE] R;
+    THIS.DIE();
+}
+
+TEXT "tunnel" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    BIFURCATE REST[ARG1, MORE];
+    ANT_TUNNEL [ARG1, MORE] R;
+    THIS.DIE();
+}
+
+TEXT "diff" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    IMPORT ANY A;
+    ANT_DIFF [REST, A] R;
+    THIS.DIE();
+}
+
+TEXT "splice" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    BIFURCATE REST[ARG1, MORE];
+    ANT_SPLICE [ARG1, MORE] R;
+    THIS.DIE();
+}
+
+TEXT "transplant" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    BIFURCATE REST[ARG1, MORE];
+    ANT_TRANSPLANT [ARG1, MORE] R;
+    THIS.DIE();
+}
+
+TEXT "status" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    IMPORT ANY A;
+    ANT_STATUS [REST, A] R;
+    THIS.DIE();
+}
+
+TEXT "deliver" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    IMPORT ANY A;
+    ANT_DELIVER [REST, A] R;
+    THIS.DIE();
+}
+
+TEXT "gather" AS S;
+STREQ [CMD, S] V;
+BRANCH(V) {
+    IMPORT ANY A;
+    ANT_GATHER [REST, A] R;
+    THIS.DIE();
+}
+
+PRINT unknown command: $CMD;
+PRINT commands: hatch collect dig log fission tunnel diff splice transplant status deliver gather;
+THIS.DIE();

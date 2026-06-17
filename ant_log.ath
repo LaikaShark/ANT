@@ -1,0 +1,44 @@
+// ant log — walk chamber history backwards
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <streq> AS STREQ;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+
+// read HEAD → tunnel → current chamber id
+READ ".ant/HEAD" AS TNAME;
+TRIM [TNAME, NULL] TNAME;
+TEXT ".ant/refs/" TNAME AS REF_PATH;
+READ REF_PATH AS CUR;
+TRIM [CUR, NULL] CUR;
+
+// walk chain: keep going while chamber id > 0
+PARSE [CUR, NULL] CUR_NUM;
+GT [CUR_NUM, 0] GOING;
+CLONE GOING AS GCHECK;
+BRANCH(!GCHECK) {
+    PRINT no chambers yet;
+    THIS.DIE();
+}
+~ATH(GOING) {
+    // read chamber metadata
+    TEXT ".ant/chambers/" CUR "/message" AS MPATH;
+    READ MPATH AS MSG;
+    TRIM [MSG, NULL] MSG;
+
+    TEXT ".ant/chambers/" CUR "/parent" AS PPATH;
+    READ PPATH AS PAR;
+    TRIM [PAR, NULL] PAR;
+
+    PRINT chamber $CUR;
+    PRINT   $MSG;
+    PRINT ;
+
+    // move to parent
+    TEXT "" CUR AS JUNK;
+    TEXT "" PAR AS CUR;
+    PARSE [CUR, NULL] CUR_NUM;
+    GT [CUR_NUM, 0] GOING;
+}
+
+THIS.DIE();

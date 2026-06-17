@@ -1,0 +1,108 @@
+// ant fission [<name> [<chamber-id>]] — split the colony
+// no args: list all tunnels
+// name only: create tunnel at current HEAD chamber
+// name + id: create tunnel at given chamber, switch to it, restore working tree
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <streq> AS STREQ;
+IMPORTF <length> AS LENGTH;
+IMPORTF <split> AS SPLIT;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <to_string> AS TO_STRING;
+
+BIFURCATE ARGS[NAME, REST];
+
+// if no name given, list branches
+CLONE NAME AS NCHECK;
+BRANCH(!NCHECK) {
+    LISTDIR ".ant/refs" AS BRANCHES;
+    READ ".ant/HEAD" AS CURRENT;
+    TRIM [CURRENT, NULL] CURRENT;
+
+    ~ATH(BRANCHES) {
+        BIFURCATE BRANCHES[BNAME, BRANCHES];
+        LENGTH [BNAME, NULL] BLEN;
+        BRANCH(BLEN) {
+            STREQ [BNAME, CURRENT] IS_CUR;
+            CLONE IS_CUR AS IC;
+            BRANCH(IC) {
+                PRINT * $BNAME;
+            }
+            ELSE {
+                PRINT   $BNAME;
+            }
+        }
+    }
+    THIS.DIE();
+}
+
+// check for optional chamber id
+CLONE REST AS RCHECK;
+BRANCH(RCHECK) {
+    BIFURCATE REST[TARGET_CID, JUNK2];
+
+    // validate chamber exists
+    TEXT ".ant/chambers/" TARGET_CID AS CDIR;
+    EXISTS CDIR AS CE;
+    CLONE CE AS CEC;
+    BRANCH(!CEC) {
+        PRINT unknown chamber: $TARGET_CID;
+        THIS.DIE();
+    }
+
+    // create ref at target chamber
+    TEXT ".ant/refs/" NAME AS NEW_REF;
+    WRITE TARGET_CID TO NEW_REF AS V;
+
+    // switch HEAD to new branch
+    WRITE NAME TO ".ant/HEAD" AS V2;
+
+    // clear forage pile
+    TEXT "" AS EMPTY;
+    WRITE EMPTY TO ".ant/forage" AS V3;
+
+    // restore working tree from target chamber
+    PARSE [TARGET_CID, NULL] CID_NUM;
+    GT [CID_NUM, 0] HAS_CHAMBER;
+    CLONE HAS_CHAMBER AS HC;
+    BRANCH(HC) {
+        TEXT CDIR "/files" AS MPATH;
+        READ MPATH AS MANIFEST;
+        TRIM [MANIFEST, NULL] MANIFEST;
+
+        TEXT "\n" AS NL;
+        SPLIT [MANIFEST, NL] FNAMES;
+        IMPORT NUMBER 0 AS IDX;
+
+        ~ATH(FNAMES) {
+            BIFURCATE FNAMES[FNAME, FNAMES];
+            LENGTH [FNAME, NULL] FLEN;
+            BRANCH(FLEN) {
+                TO_STRING [IDX, NULL] IDX_S;
+                TEXT CDIR "/" IDX_S AS BPATH;
+                READ BPATH AS CONTENT;
+                WRITE CONTENT TO FNAME AS V4;
+                ADD [IDX, 1] IDX;
+            }
+        }
+    }
+
+    PRINT colony split: $NAME (at chamber $TARGET_CID, working tree restored);
+    THIS.DIE();
+}
+
+// no chamber id — create branch at current HEAD's chamber
+READ ".ant/HEAD" AS CURRENT;
+TRIM [CURRENT, NULL] CURRENT;
+TEXT ".ant/refs/" CURRENT AS CUR_REF;
+READ CUR_REF AS CID;
+TRIM [CID, NULL] CID;
+
+// write chamber id to new ref
+TEXT ".ant/refs/" NAME AS NEW_REF;
+WRITE CID TO NEW_REF AS V;
+
+PRINT colony split: $NAME (at chamber $CID);
+THIS.DIE();

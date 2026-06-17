@@ -1,0 +1,182 @@
+// ant gather <host> <port> <colony-id> <password> — pull from colony
+// ARGS = [HOST, [PORT_S, [COLONY_ID, [PASS, _]]]]
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <concat> AS CONCAT;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <sub> AS SUB;
+IMPORTF <to_string> AS TO_STRING;
+IMPORTF <streq> AS STREQ;
+IMPORTF <length> AS LENGTH;
+
+BIFURCATE ARGS[INNER, JUNK];
+BIFURCATE INNER[HOST, INNER];
+BIFURCATE INNER[PORT_S, INNER];
+BIFURCATE INNER[COLONY_ID, INNER];
+BIFURCATE INNER[PASS, JUNK2];
+
+PARSE [PORT_S, NULL] PORT;
+CONNECT HOST PORT AS CONN;
+CLONE CONN AS CC;
+BRANCH(!CC) {
+    PRINT failed to connect to $HOST:$PORT_S;
+    THIS.DIE();
+}
+
+// AUTH
+TEXT "AUTH " COLONY_ID " " PASS AS AUTH_MSG;
+SEND AUTH_MSG TO CONN;
+RECV FROM CONN AS REPLY;
+TRIM [REPLY, NULL] REPLY;
+TEXT "OK" AS OK;
+STREQ [REPLY, OK] ROK;
+CLONE ROK AS ROKC;
+BRANCH(!ROKC) {
+    PRINT auth failed: $REPLY;
+    CLOSE CONN;
+    THIS.DIE();
+}
+
+TEXT " " AS SP;
+TEXT "\n" AS NL;
+
+// scaffold local .ant/ if needed
+EXISTS ".ant" AS AE;
+CLONE AE AS AEC;
+BRANCH(!AEC) {
+    MKDIR ".ant";
+    MKDIR ".ant/refs";
+    MKDIR ".ant/chambers";
+}
+
+// PULL
+SEND "PULL" TO CONN;
+
+// HEAD
+RECV FROM CONN AS HL;
+SPLIT [HL, SP] HP;
+BIFURCATE HP[HCMD, HP];
+BIFURCATE HP[HVAL, HJNK];
+WRITE HVAL TO ".ant/HEAD" AS VH;
+
+// NEXTID
+RECV FROM CONN AS NL2;
+SPLIT [NL2, SP] NP;
+BIFURCATE NP[NCMD, NP];
+BIFURCATE NP[NVAL, NJNK];
+WRITE NVAL TO ".ant/next_id" AS VN;
+
+// REFS <count>
+RECV FROM CONN AS RL;
+SPLIT [RL, SP] RP;
+BIFURCATE RP[RCMD, RP];
+BIFURCATE RP[RC_S, RJNK];
+PARSE [RC_S, NULL] RC;
+IMPORT NUMBER 0 AS RI;
+GT [RC, RI] RMORE;
+~ATH(RMORE) {
+    RECV FROM CONN AS RLINE;
+    SPLIT [RLINE, SP] RLP;
+    BIFURCATE RLP[RNAME, RLP];
+    BIFURCATE RLP[RCID, RJNK2];
+    TEXT ".ant/refs/" RNAME AS RFP;
+    WRITE RCID TO RFP AS VR;
+    ADD [RI, 1] RI;
+    GT [RC, RI] RMORE;
+}
+
+// CHAMBERS <count>
+RECV FROM CONN AS CHL;
+SPLIT [CHL, SP] CHP;
+BIFURCATE CHP[CHCMD, CHP];
+BIFURCATE CHP[CHC_S, CHJNK];
+PARSE [CHC_S, NULL] CHC;
+IMPORT NUMBER 0 AS CHI;
+GT [CHC, CHI] CHMORE;
+~ATH(CHMORE) {
+    // <cid> <filecount>
+    RECV FROM CONN AS CHLINE;
+    SPLIT [CHLINE, SP] CHLP;
+    BIFURCATE CHLP[CHID, CHLP];
+    BIFURCATE CHLP[FC_S, CHJNK2];
+    TEXT ".ant/chambers/" CHID AS CDIR;
+    MKDIR CDIR;
+
+    PARSE [FC_S, NULL] FC;
+    IMPORT NUMBER 0 AS FI;
+    SUB [FI, FI] FI;
+    GT [FC, FI] FMORE;
+    ~ATH(FMORE) {
+        // <filename> <linecount>
+        RECV FROM CONN AS FHDR;
+        SPLIT [FHDR, SP] FHP;
+        BIFURCATE FHP[FNAME, FHP];
+        BIFURCATE FHP[LC_S, FJNK];
+
+        PARSE [LC_S, NULL] LC;
+        TEXT "" AS FDATA;
+        IMPORT NUMBER 0 AS LI;
+        SUB [LI, LI] LI;
+        GT [LC, LI] LMORE;
+        ~ATH(LMORE) {
+            RECV FROM CONN AS FLINE;
+            CLONE FDATA AS FDC;
+            BRANCH(FDC) {
+                CONCAT [FDATA, NL] FDATA;
+            }
+            CONCAT [FDATA, FLINE] FDATA;
+            ADD [LI, 1] LI;
+            GT [LC, LI] LMORE;
+        }
+
+        TEXT CDIR "/" FNAME AS FFP;
+        WRITE FDATA TO FFP AS VP;
+        ADD [FI, 1] FI;
+        GT [FC, FI] FMORE;
+    }
+
+    ADD [CHI, 1] CHI;
+    GT [CHC, CHI] CHMORE;
+}
+
+// wait for OK
+RECV FROM CONN AS PREPLY;
+
+// restore working tree from HEAD tip
+TRIM [HVAL, NULL] HVAL;
+TEXT ".ant/refs/" HVAL AS HREF;
+READ HREF AS TIP;
+TRIM [TIP, NULL] TIP;
+
+PARSE [TIP, NULL] TIP_NUM;
+GT [TIP_NUM, 0] HAS_TIP;
+CLONE HAS_TIP AS HTC;
+BRANCH(HTC) {
+    TEXT ".ant/chambers/" TIP "/files" AS MPATH;
+    READ MPATH AS MANIFEST;
+    TRIM [MANIFEST, NULL] MANIFEST;
+
+    SPLIT [MANIFEST, NL] FNAMES;
+    IMPORT NUMBER 0 AS IDX;
+    ~ATH(FNAMES) {
+        BIFURCATE FNAMES[WFNAME, FNAMES];
+        CLONE WFNAME AS WFC;
+        BRANCH(WFC) {
+            TO_STRING [IDX, NULL] IDX_S;
+            TEXT ".ant/chambers/" TIP "/" IDX_S AS BPATH;
+            READ BPATH AS BLOB;
+            WRITE BLOB TO WFNAME AS VW;
+            ADD [IDX, 1] IDX;
+        }
+    }
+}
+
+SEND "BYE" TO CONN;
+CLOSE CONN;
+TEXT "" AS EMPTY;
+WRITE EMPTY TO ".ant/forage" AS VF;
+PRINT gathered from $COLONY_ID at $HOST:$PORT_S;
+THIS.DIE();

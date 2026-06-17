@@ -1,0 +1,124 @@
+// ant transplant <src> [<dest>] — copy a colony to a new location
+// reconstructs .ant/ structure from source, restores working tree
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <concat> AS CONCAT;
+IMPORTF <length> AS LENGTH;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <to_string> AS TO_STRING;
+
+BIFURCATE ARGS[SRC, REST];
+
+// dest defaults to SRC-colony
+CLONE REST AS RC;
+BRANCH(RC) {
+    BIFURCATE REST[DEST, JUNK];
+}
+ELSE {
+    TEXT SRC "-colony" AS DEST;
+}
+
+// scaffold destination
+MKDIR DEST;
+TEXT DEST "/.ant" AS DA;
+MKDIR DA;
+TEXT DA "/refs" AS DR;
+MKDIR DR;
+TEXT DA "/chambers" AS DC;
+MKDIR DC;
+
+// copy HEAD
+TEXT SRC "/.ant/HEAD" AS SHP;
+READ SHP AS HEAD;
+TEXT DA "/HEAD" AS DHP;
+WRITE HEAD TO DHP AS V1;
+TRIM [HEAD, NULL] HEAD;
+
+// copy next_id
+TEXT SRC "/.ant/next_id" AS SNP;
+READ SNP AS NID;
+TEXT DA "/next_id" AS DNP;
+WRITE NID TO DNP AS V2;
+
+// fresh forage pile
+TEXT "" AS EMPTY;
+TEXT DA "/forage" AS DFP;
+WRITE EMPTY TO DFP AS V3;
+
+// copy refs
+TEXT SRC "/.ant/refs" AS SRP;
+LISTDIR SRP AS REFS;
+~ATH(REFS) {
+    BIFURCATE REFS[RNAME, REFS];
+    CLONE RNAME AS RNC;
+    BRANCH(RNC) {
+        TEXT SRP "/" RNAME AS SRFP;
+        READ SRFP AS RVAL;
+        TEXT DR "/" RNAME AS DRFP;
+        WRITE RVAL TO DRFP AS V4;
+    }
+}
+
+// copy chambers
+TEXT SRC "/.ant/chambers" AS SCP;
+LISTDIR SCP AS CIDS;
+~ATH(CIDS) {
+    BIFURCATE CIDS[CID, CIDS];
+    CLONE CID AS CC;
+    BRANCH(CC) {
+        // create chamber dir
+        TEXT DC "/" CID AS DCD;
+        MKDIR DCD;
+
+        // list and copy all files in this chamber
+        TEXT SCP "/" CID AS SCD;
+        LISTDIR SCD AS CFILES;
+        ~ATH(CFILES) {
+            BIFURCATE CFILES[CF, CFILES];
+            CLONE CF AS CFC;
+            BRANCH(CFC) {
+                TEXT SCD "/" CF AS SCFP;
+                READ SCFP AS CDATA;
+                TEXT DCD "/" CF AS DCFP;
+                WRITE CDATA TO DCFP AS V5;
+            }
+        }
+    }
+}
+
+// restore working tree from HEAD tip
+TEXT DR "/" HEAD AS HREF;
+READ HREF AS TIP;
+TRIM [TIP, NULL] TIP;
+
+PARSE [TIP, NULL] TIP_NUM;
+GT [TIP_NUM, 0] HAS_TIP;
+CLONE HAS_TIP AS HTC;
+BRANCH(HTC) {
+    TEXT DC "/" TIP "/files" AS MPATH;
+    READ MPATH AS MANIFEST;
+    TRIM [MANIFEST, NULL] MANIFEST;
+
+    TEXT "\n" AS NL;
+    SPLIT [MANIFEST, NL] FNAMES;
+    IMPORT NUMBER 0 AS IDX;
+
+    ~ATH(FNAMES) {
+        BIFURCATE FNAMES[FNAME, FNAMES];
+        CLONE FNAME AS FNC;
+        BRANCH(FNC) {
+            TO_STRING [IDX, NULL] IDX_S;
+            TEXT DC "/" TIP "/" IDX_S AS BPATH;
+            READ BPATH AS BLOB;
+            TEXT DEST "/" FNAME AS DFPATH;
+            WRITE BLOB TO DFPATH AS V6;
+            ADD [IDX, 1] IDX;
+        }
+    }
+}
+
+PRINT colony transplanted to $DEST;
+THIS.DIE();

@@ -1,0 +1,162 @@
+// ant deliver <host> <port> <colony-id> <password> — push to colony
+// ARGS = [HOST, [PORT_S, [COLONY_ID, [PASS, _]]]]
+
+IMPORTF <trim> AS TRIM;
+IMPORTF <split> AS SPLIT;
+IMPORTF <concat> AS CONCAT;
+IMPORTF <parse> AS PARSE;
+IMPORTF <gt> AS GT;
+IMPORTF <add> AS ADD;
+IMPORTF <sub> AS SUB;
+IMPORTF <to_string> AS TO_STRING;
+IMPORTF <streq> AS STREQ;
+
+BIFURCATE ARGS[INNER, JUNK];
+BIFURCATE INNER[HOST, INNER];
+BIFURCATE INNER[PORT_S, INNER];
+BIFURCATE INNER[COLONY_ID, INNER];
+BIFURCATE INNER[PASS, JUNK2];
+
+PARSE [PORT_S, NULL] PORT;
+CONNECT HOST PORT AS CONN;
+CLONE CONN AS CC;
+BRANCH(!CC) {
+    PRINT failed to connect to $HOST:$PORT_S;
+    THIS.DIE();
+}
+
+// AUTH
+TEXT "AUTH " COLONY_ID " " PASS AS AUTH_MSG;
+SEND AUTH_MSG TO CONN;
+RECV FROM CONN AS REPLY;
+TRIM [REPLY, NULL] REPLY;
+TEXT "OK" AS OK;
+STREQ [REPLY, OK] ROK;
+CLONE ROK AS ROKC;
+BRANCH(!ROKC) {
+    PRINT auth failed: $REPLY;
+    CLOSE CONN;
+    THIS.DIE();
+}
+
+TEXT " " AS SP;
+TEXT "\n" AS NL;
+
+// PUSH
+SEND "PUSH" TO CONN;
+
+// HEAD
+READ ".ant/HEAD" AS HVAL;
+TRIM [HVAL, NULL] HVAL;
+TEXT "HEAD " HVAL AS HM;
+SEND HM TO CONN;
+
+// NEXTID
+READ ".ant/next_id" AS NVAL;
+TRIM [NVAL, NULL] NVAL;
+TEXT "NEXTID " NVAL AS NM;
+SEND NM TO CONN;
+
+// REFS — count then send
+LISTDIR ".ant/refs" AS RLIST;
+IMPORT NUMBER 0 AS RCNT;
+CLONE RLIST AS RLC;
+~ATH(RLC) {
+    BIFURCATE RLC[RN, RLC];
+    CLONE RN AS RNC;
+    BRANCH(RNC) {
+        ADD [RCNT, 1] RCNT;
+    }
+}
+TO_STRING [RCNT, NULL] RCNT_S;
+TEXT "REFS " RCNT_S AS RM;
+SEND RM TO CONN;
+LISTDIR ".ant/refs" AS RLIST2;
+~ATH(RLIST2) {
+    BIFURCATE RLIST2[RNAME, RLIST2];
+    CLONE RNAME AS RNC;
+    BRANCH(RNC) {
+        TEXT ".ant/refs/" RNAME AS RFP;
+        READ RFP AS RCID;
+        TRIM [RCID, NULL] RCID;
+        TEXT RNAME " " RCID AS RENTRY;
+        SEND RENTRY TO CONN;
+    }
+}
+
+// CHAMBERS — count then send
+LISTDIR ".ant/chambers" AS CHLIST;
+IMPORT NUMBER 0 AS CHCNT;
+CLONE CHLIST AS CHLC;
+~ATH(CHLC) {
+    BIFURCATE CHLC[CN, CHLC];
+    CLONE CN AS CNC;
+    BRANCH(CNC) {
+        ADD [CHCNT, 1] CHCNT;
+    }
+}
+TO_STRING [CHCNT, NULL] CHCNT_S;
+TEXT "CHAMBERS " CHCNT_S AS CHM;
+SEND CHM TO CONN;
+LISTDIR ".ant/chambers" AS CHLIST2;
+~ATH(CHLIST2) {
+    BIFURCATE CHLIST2[CHID, CHLIST2];
+    CLONE CHID AS CHIDC;
+    BRANCH(CHIDC) {
+        TEXT ".ant/chambers/" CHID AS SCHD;
+        LISTDIR SCHD AS CFLIST;
+        // count files
+        IMPORT NUMBER 0 AS FCNT;
+        SUB [FCNT, FCNT] FCNT;
+        CLONE CFLIST AS CFLC;
+        ~ATH(CFLC) {
+            BIFURCATE CFLC[CFN, CFLC];
+            CLONE CFN AS CFNC;
+            BRANCH(CFNC) {
+                ADD [FCNT, 1] FCNT;
+            }
+        }
+        TO_STRING [FCNT, NULL] FCNT_S;
+        TEXT CHID " " FCNT_S AS CHENTRY;
+        SEND CHENTRY TO CONN;
+
+        // send files
+        LISTDIR SCHD AS CFLIST2;
+        ~ATH(CFLIST2) {
+            BIFURCATE CFLIST2[CFNAME, CFLIST2];
+            CLONE CFNAME AS CFNC2;
+            BRANCH(CFNC2) {
+                TEXT SCHD "/" CFNAME AS CFFP;
+                READ CFFP AS CFDATA;
+
+                // count lines
+                SPLIT [CFDATA, NL] LCLINES;
+                IMPORT NUMBER 0 AS LNCNT;
+                SUB [LNCNT, LNCNT] LNCNT;
+                ~ATH(LCLINES) {
+                    BIFURCATE LCLINES[LCL, LCLINES];
+                    ADD [LNCNT, 1] LNCNT;
+                }
+                TO_STRING [LNCNT, NULL] LNCNT_S;
+                TEXT CFNAME " " LNCNT_S AS FENTRY;
+                SEND FENTRY TO CONN;
+
+                // send lines
+                SPLIT [CFDATA, NL] SLLINES;
+                ~ATH(SLLINES) {
+                    BIFURCATE SLLINES[SLL, SLLINES];
+                    SEND SLL TO CONN;
+                }
+            }
+        }
+    }
+}
+
+// wait for OK
+RECV FROM CONN AS PREPLY;
+TRIM [PREPLY, NULL] PREPLY;
+
+SEND "BYE" TO CONN;
+CLOSE CONN;
+PRINT delivered to $COLONY_ID at $HOST:$PORT_S;
+THIS.DIE();
