@@ -436,26 +436,9 @@ SPLIT [MAIN_LIST, NL] RIDS;
                 }
             }
 
-            // branch commits done — deactivate column, mark shown
+            // mark commits shown (column stays alive until fission)
             CONCAT [SHOWN, SPLICE_BRANCH] SHOWN;
             CONCAT [SHOWN, PIPE] SHOWN;
-            TEXT "" AS NEW_ALIVE;
-            TEXT PIPE AS NA_PIPE;
-            CONCAT [NEW_ALIVE, NA_PIPE] NEW_ALIVE;
-            SPLIT [ALIVE, PIPE] APARTS;
-            ~ATH(APARTS) {
-                BIFURCATE APARTS[APART, APARTS];
-                CLONE APART AS APC;
-                BRANCH(APC) {
-                    STREQ [APART, SPLICE_BRANCH] AP_MATCH;
-                    CLONE AP_MATCH AS APMC;
-                    BRANCH(!APMC) {
-                        CONCAT [NEW_ALIVE, APART] NEW_ALIVE;
-                        CONCAT [NEW_ALIVE, PIPE] NEW_ALIVE;
-                    }
-                }
-            }
-            TEXT "" NEW_ALIVE AS ALIVE;
         }
 
         // ── render main commit line ──
