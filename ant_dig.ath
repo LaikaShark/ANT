@@ -1,5 +1,6 @@
-// ant dig <message> — store foraged files into a new chamber
-// ARGS = [MESSAGE, _]
+// ant dig <message> [<name>] — store foraged files into a new chamber
+// ARGS = [MESSAGE, REST]
+// optional REST = [NAME, _]
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <split> AS SPLIT;
@@ -10,7 +11,7 @@ IMPORTF <to_string> AS TO_STRING;
 IMPORTF <parse> AS PARSE;
 IMPORTF <now> AS NOW;
 
-BIFURCATE ARGS[MSG, JUNK];
+BIFURCATE ARGS[MSG, REST];
 
 // read current tunnel and its ref
 READ ".ant/HEAD" AS TNAME;
@@ -47,6 +48,17 @@ TEXT CDIR "/parent" AS PPATH;
 WRITE PARENT TO PPATH AS V2;
 TEXT CDIR "/message" AS MPATH;
 WRITE MSG TO MPATH AS V3;
+
+// write optional chamber name
+CLONE REST AS RCHECK;
+BRANCH(RCHECK) {
+    BIFURCATE REST[CNAME, JUNK2];
+    CLONE CNAME AS CNCHECK;
+    BRANCH(CNCHECK) {
+        TEXT CDIR "/name" AS NPATH;
+        WRITE CNAME TO NPATH AS V8;
+    }
+}
 
 // store each collected file into the chamber
 TEXT "\n" AS NL;

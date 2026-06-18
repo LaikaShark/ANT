@@ -30,7 +30,18 @@ BRANCH(!GCHECK) {
     READ PPATH AS PAR;
     TRIM [PAR, NULL] PAR;
 
-    PRINT chamber $CUR;
+    // check for optional chamber name
+    TEXT ".ant/chambers/" CUR "/name" AS NMPATH;
+    EXISTS NMPATH AS HAS_NAME;
+    CLONE HAS_NAME AS HNC;
+    BRANCH(HNC) {
+        READ NMPATH AS CNAME;
+        TRIM [CNAME, NULL] CNAME;
+        PRINT chamber $CUR ($CNAME);
+    }
+    ELSE {
+        PRINT chamber $CUR;
+    }
     PRINT   $MSG;
     PRINT ;
 

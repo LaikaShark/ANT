@@ -1,7 +1,8 @@
-// ant fission [<name> [<chamber-id>]] — split the colony
+// ant fission [<name> [<chamber-id-or-name>]] — split the colony
 // no args: list all tunnels
 // name only: create tunnel at current HEAD chamber
-// name + id: create tunnel at given chamber, switch to it, restore working tree
+// name + id/name: create tunnel at given chamber, switch to it, restore working tree
+//   accepts a numeric chamber id or a chamber name set by "ant dig <msg> <name>"
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <streq> AS STREQ;
@@ -38,18 +39,54 @@ BRANCH(!NCHECK) {
     THIS.DIE();
 }
 
-// check for optional chamber id
+// check for optional chamber id or name
 CLONE REST AS RCHECK;
 BRANCH(RCHECK) {
-    BIFURCATE REST[TARGET_CID, JUNK2];
+    BIFURCATE REST[TARGET, JUNK2];
 
-    // validate chamber exists
-    TEXT ".ant/chambers/" TARGET_CID AS CDIR;
+    // try as numeric chamber id first
+    TEXT ".ant/chambers/" TARGET AS CDIR;
     EXISTS CDIR AS CE;
     CLONE CE AS CEC;
-    BRANCH(!CEC) {
-        PRINT unknown chamber: $TARGET_CID;
-        THIS.DIE();
+    BRANCH(CEC) {
+        // numeric id matched — use it directly
+        TEXT "" TARGET AS TARGET_CID;
+    }
+    ELSE {
+        // not a numeric id — search chamber names
+        LISTDIR ".ant/chambers" AS CIDS;
+        IMPORT ALIVE FOUND;
+        FOUND.DIE();
+        TEXT "" AS TARGET_CID;
+
+        ~ATH(CIDS) {
+            BIFURCATE CIDS[CID, CIDS];
+            CLONE CID AS CIDC;
+            BRANCH(CIDC) {
+                TEXT ".ant/chambers/" CID "/name" AS NPATH;
+                EXISTS NPATH AS NE;
+                CLONE NE AS NEC;
+                BRANCH(NEC) {
+                    READ NPATH AS CNAME;
+                    TRIM [CNAME, NULL] CNAME;
+                    STREQ [CNAME, TARGET] MATCH;
+                    CLONE MATCH AS MC;
+                    BRANCH(MC) {
+                        TEXT "" CID AS TARGET_CID;
+                        IMPORT ALIVE FMARK;
+                        BIFURCATE [FMARK, NULL] FOUND;
+                    }
+                }
+            }
+        }
+
+        CLONE FOUND AS FC;
+        BRANCH(!FC) {
+            PRINT unknown chamber: $TARGET;
+            THIS.DIE();
+        }
+
+        TEXT ".ant/chambers/" TARGET_CID AS CDIR;
     }
 
     // create ref at target chamber
