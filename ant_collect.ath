@@ -1,4 +1,9 @@
-// ant collect <filename> — bring a file to the forage pile
+// ant collect <file> — stage a file for the next dig
+//
+// reads .ant/forage (newline-separated list of staged filenames).
+// scans existing entries to prevent duplicates. if the file is not
+// already staged, appends it to the forage pile and writes it back.
+//
 // ARGS = [FILENAME, _]
 
 IMPORTF <streq> AS STREQ;
@@ -13,14 +18,15 @@ BIFURCATE ARGS[FNAME, JUNK];
 READ ".ant/forage" AS PILE;
 TRIM [PILE, NULL] PILE;
 
-// check if already collected: split by newline, walk entries
+// split forage entries for scanning
 TEXT "\n" AS NL;
 SPLIT [PILE, NL] LINES;
 
-// scan for existing entry (compose to rebind; IMPORT is first-time-only)
+// FOUND flag flips on match (IMPORT is first-bind-only, BIFURCATE rebinds)
 IMPORT ALIVE FOUND;
 FOUND.DIE();
 
+// scan forage entries for existing match
 ~ATH(LINES) {
     BIFURCATE LINES[LINE, LINES];
     LENGTH [LINE, NULL] LLEN;
@@ -33,13 +39,13 @@ FOUND.DIE();
     }
 }
 
-// if not already collected, append
+// if not found, append filename to forage pile
 CLONE FOUND AS FCHECK;
 BRANCH(FCHECK) {
     PRINT already collected: $FNAME;
 }
 ELSE {
-    // build new pile: old content + newline + filename
+    // append filename with newline separator if pile is non-empty
     CLONE PILE AS PCHECK;
     BRANCH(PCHECK) {
         CONCAT [PILE, NL] PILE;

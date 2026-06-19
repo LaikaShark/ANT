@@ -1,5 +1,17 @@
-// ant transplant <src> [<dest>] — copy a colony to a new location
-// reconstructs .ant/ structure from source, restores working tree
+// ant transplant <src> [<dst>] — copy a colony to a new location
+//
+// ARGS = [SRC, REST] where REST = [DEST, _] or NULL
+// if no dest given, defaults to <src>-colony
+//
+// algorithm:
+//   create destination directory with full .ant/ scaffold
+//   copy .ant/HEAD, .ant/next_id
+//   create empty .ant/forage
+//   copy all refs: for each file in .ant/refs/, read and write
+//   copy all chambers: for each chamber dir, create it and copy
+//     every file inside (parent, message, name, files, blobs)
+//   restore working tree: read HEAD tunnel's tip chamber manifest,
+//     write each blob to dest/<filename>
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <split> AS SPLIT;
@@ -21,7 +33,7 @@ ELSE {
     TEXT SRC "-colony" AS DEST;
 }
 
-// scaffold destination
+// MKDIR scaffolds the dest/.ant/ hierarchy
 MKDIR DEST;
 TEXT DEST "/.ant" AS DA;
 MKDIR DA;
@@ -62,7 +74,7 @@ LISTDIR SRP AS REFS;
     }
 }
 
-// copy chambers
+// outer LISTDIR on chambers/ iterates chamber ids
 TEXT SRC "/.ant/chambers" AS SCP;
 LISTDIR SCP AS CIDS;
 ~ATH(CIDS) {
@@ -73,7 +85,7 @@ LISTDIR SCP AS CIDS;
         TEXT DC "/" CID AS DCD;
         MKDIR DCD;
 
-        // list and copy all files in this chamber
+        // inner LISTDIR copies every file within each chamber directory
         TEXT SCP "/" CID AS SCD;
         LISTDIR SCD AS CFILES;
         ~ATH(CFILES) {
@@ -89,7 +101,7 @@ LISTDIR SCP AS CIDS;
     }
 }
 
-// restore working tree from HEAD tip
+// final restore loop reads manifest + blobs from the tip chamber
 TEXT DR "/" HEAD AS HREF;
 READ HREF AS TIP;
 TRIM [TIP, NULL] TIP;

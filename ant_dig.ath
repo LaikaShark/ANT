@@ -1,6 +1,23 @@
-// ant dig <message> [<name>] — store foraged files into a new chamber
-// ARGS = [MESSAGE, REST]
-// optional REST = [NAME, _]
+// ant dig <message> [<name>] — commit foraged files into a new chamber
+//
+// algorithm:
+//   read current tunnel name from .ant/HEAD, resolve to tip chamber id
+//   allocate new chamber id by reading and bumping .ant/next_id
+//   read .ant/forage for list of staged filenames
+//   abort if forage pile is empty
+//   create .ant/chambers/<id>/ directory with:
+//     parent  — previous tip chamber id (forms the history chain)
+//     message — commit message from first arg
+//     name    — optional chamber name from second arg
+//   for each staged filename:
+//     read file content from working tree
+//     write as numbered blob: .ant/chambers/<id>/<index>
+//   write manifest: newline-separated filename list where line N
+//     corresponds to blob file N
+//   update tunnel ref (.ant/refs/<tunnel>) to point to new chamber
+//   clear .ant/forage
+//
+// ARGS = [MESSAGE, REST] where REST = [NAME, _] or NULL
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <split> AS SPLIT;
@@ -20,7 +37,7 @@ TEXT ".ant/refs/" TNAME AS REF_PATH;
 READ REF_PATH AS PARENT;
 TRIM [PARENT, NULL] PARENT;
 
-// read and bump chamber id counter
+// PARSE+ADD+TO_STRING on next_id allocates the chamber id and bumps the counter
 READ ".ant/next_id" AS ID_STR;
 TRIM [ID_STR, NULL] ID_STR;
 PARSE [ID_STR, NULL] ID_NUM;
@@ -49,7 +66,7 @@ WRITE PARENT TO PPATH AS V2;
 TEXT CDIR "/message" AS MPATH;
 WRITE MSG TO MPATH AS V3;
 
-// write optional chamber name
+// REST is checked for optional chamber name
 CLONE REST AS RCHECK;
 BRANCH(RCHECK) {
     BIFURCATE REST[CNAME, JUNK2];
@@ -60,10 +77,12 @@ BRANCH(RCHECK) {
     }
 }
 
-// store each collected file into the chamber
+// SPLIT [PILE, NL] iterates staged filenames
 TEXT "\n" AS NL;
 SPLIT [PILE, NL] FILES;
+// IDX tracks blob numbering; TO_STRING converts for filename
 IMPORT NUMBER 0 AS IDX;
+// MANIFEST is built incrementally with CONCAT (NL separator between entries, none before first)
 TEXT "" AS MANIFEST;
 
 ~ATH(FILES) {

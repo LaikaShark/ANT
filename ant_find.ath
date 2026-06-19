@@ -1,6 +1,22 @@
-// ant_find — look up a file's blob content from a chamber's cumulative snapshot
+// ant_find — look up a file's content from a chamber's cumulative snapshot
+//
 // ARGS = [FNAME, CID]
-// walks parent chain; returns blob content if found, NULL if not
+// returns: blob content if file exists in CID's history, NULL otherwise
+//
+// algorithm:
+//   walk the parent chain starting from CID
+//   at each chamber, scan its manifest for FNAME
+//   if found, read the blob at the matching manifest index and return it
+//   if not found in any ancestor, return NULL (dead THIS)
+//
+// notes:
+//   IDX resets per chamber via PARSE [ZERO_STR, NULL] IDX because
+//   IMPORT NUMBER is first-bind-only and won't re-fire in a loop.
+//   IDX only increments on non-match (ELSE branch) so it equals
+//   the correct blob index when a match is found.
+//   CLONE RESULT / CLONE SEARCHING guards prevent code after DIE
+//   from executing (DIE inside BRANCH doesn't skip the rest of
+//   the ~ATH iteration body).
 
 IMPORTF <streq> AS STREQ;
 IMPORTF <trim> AS TRIM;
@@ -21,12 +37,14 @@ GT [CN, 0] SEARCHING;
 IMPORT ALIVE RESULT;
 RESULT.DIE();
 
+// outer ~ATH(SEARCHING) walks chambers via parent links
 ~ATH(SEARCHING) {
     TEXT ".ant/chambers/" CUR "/files" AS MPATH;
     READ MPATH AS MANIFEST;
     TRIM [MANIFEST, NULL] MANIFEST;
 
     SPLIT [MANIFEST, NL] MFILES;
+    // inner ~ATH(MFILES) scans one manifest; PARSE resets IDX to 0
     PARSE [ZERO_STR, NULL] IDX;
 
     ~ATH(MFILES) {
@@ -39,6 +57,7 @@ RESULT.DIE();
                 TO_STRING [IDX, NULL] IDX_S;
                 TEXT ".ant/chambers/" CUR "/" IDX_S AS BPATH;
                 READ BPATH AS CONTENT;
+                // BIFURCATE [CONTENT, NULL] RESULT stores found blob and sets RESULT alive
                 BIFURCATE [CONTENT, NULL] RESULT;
             }
             ELSE {
@@ -47,11 +66,13 @@ RESULT.DIE();
         }
     }
 
+    // CLONE RESULT after inner loop: if found, kill SEARCHING to stop walking
     CLONE RESULT AS RC;
     BRANCH(RC) {
         SEARCHING.DIE();
     }
 
+    // CLONE SEARCHING after that: if still alive, advance to parent chamber
     CLONE SEARCHING AS SC;
     BRANCH(SC) {
         TEXT ".ant/chambers/" CUR "/parent" AS PP;
@@ -63,6 +84,7 @@ RESULT.DIE();
     }
 }
 
+// final CLONE RESULT: if found, return content via THIS.DIE(CONTENT)
 CLONE RESULT AS RC2;
 BRANCH(RC2) {
     BIFURCATE RESULT[CONTENT, JUNK2];

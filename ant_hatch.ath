@@ -1,4 +1,14 @@
-// ant hatch — found a new colony
+// ant hatch — initialize a new colony
+//
+// creates the .ant/ directory scaffold:
+//   .ant/HEAD         — current tunnel name, initialized to "main"
+//   .ant/refs/main    — main tunnel's tip chamber id, initialized to 0
+//   .ant/forage       — staging area for collected files, starts empty
+//   .ant/next_id      — monotonic chamber counter, starts at 1
+//   .ant/chambers/    — directory holding all chamber data
+//
+// chamber id 0 is the sentinel meaning "no parent".
+// ids increment from 1 for each dig.
 
 EXISTS ".ant" AS ALREADY;
 CLONE ALREADY AS AC;
@@ -7,18 +17,24 @@ BRANCH(AC) {
     THIS.DIE();
 }
 
+// .ant/ root directory
 MKDIR ".ant";
+// tunnel references directory
 MKDIR ".ant/refs";
+// chamber storage directory
 MKDIR ".ant/chambers";
 
+// initialize HEAD to "main" tunnel
 TEXT "main" AS BNAME;
 WRITE BNAME TO ".ant/HEAD" AS V1;
+// main tunnel tip starts at chamber 0 (no commits yet)
 TEXT "0" AS ZERO;
 WRITE ZERO TO ".ant/refs/main" AS V2;
 
-// forage pile starts empty; next chamber id is 1 (0 means "no parent")
+// forage staging area starts empty
 TEXT "" AS EMPTY;
 WRITE EMPTY TO ".ant/forage" AS V3;
+// next chamber id starts at 1 (0 is sentinel for no parent)
 TEXT "1" AS ONE;
 WRITE ONE TO ".ant/next_id" AS V4;
 

@@ -1,18 +1,23 @@
-// ant log — walk chamber history backwards
+// ant log — walk chamber history from HEAD tip to root
+//
+// reads HEAD tunnel name, resolves to tip chamber id.
+// walks the parent chain: for each chamber, prints its id,
+// optional name (if .ant/chambers/<id>/name exists), and message.
+// stops when parent is 0 (root sentinel).
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <streq> AS STREQ;
 IMPORTF <parse> AS PARSE;
 IMPORTF <gt> AS GT;
 
-// read HEAD → tunnel → current chamber id
+// read HEAD tunnel name, resolve to tip chamber id
 READ ".ant/HEAD" AS TNAME;
 TRIM [TNAME, NULL] TNAME;
 TEXT ".ant/refs/" TNAME AS REF_PATH;
 READ REF_PATH AS CUR;
 TRIM [CUR, NULL] CUR;
 
-// walk chain: keep going while chamber id > 0
+// walk parent chain while chamber id > 0
 PARSE [CUR, NULL] CUR_NUM;
 GT [CUR_NUM, 0] GOING;
 CLONE GOING AS GCHECK;
@@ -21,7 +26,7 @@ BRANCH(!GCHECK) {
     THIS.DIE();
 }
 ~ATH(GOING) {
-    // read chamber metadata
+    // read message and parent from chamber directory
     TEXT ".ant/chambers/" CUR "/message" AS MPATH;
     READ MPATH AS MSG;
     TRIM [MSG, NULL] MSG;
@@ -30,7 +35,7 @@ BRANCH(!GCHECK) {
     READ PPATH AS PAR;
     TRIM [PAR, NULL] PAR;
 
-    // check for optional chamber name
+    // check for optional chamber name file
     TEXT ".ant/chambers/" CUR "/name" AS NMPATH;
     EXISTS NMPATH AS HAS_NAME;
     CLONE HAS_NAME AS HNC;
@@ -45,7 +50,7 @@ BRANCH(!GCHECK) {
     PRINT   $MSG;
     PRINT ;
 
-    // move to parent
+    // advance to parent chamber
     TEXT "" CUR AS JUNK;
     TEXT "" PAR AS CUR;
     PARSE [CUR, NULL] CUR_NUM;
