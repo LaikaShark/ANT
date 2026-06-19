@@ -9,14 +9,18 @@
 // algorithm:
 //   1. walk main's parent chain to collect MAIN_IDS and MAIN_LIST
 //   2. for each non-HEAD branch, walk its chain to find the fork
-//      point (first ancestor on main). record name, tip, fork in
-//      BRANCHES. stale branches (tip == fork, already on main) are
-//      excluded from BRANCHES
+//      point (first ancestor on main). record name, tip, fork.
+//      also build BRANCH_COMMITS lookup of exclusive commits
+//   2b. resolve parent branches: for each branch, walk chain from
+//       tip checking BRANCH_COMMITS. first hit on another branch's
+//       exclusive commits determines parent and true fork point.
+//       BRANCHES format: name\ttip\tfork\tparent\n
 //   3. scan main chambers for splice messages ("splice tunnel 'X'").
 //      match each against BRANCHES to build SPLICES (cid → branch)
-//   4. build LAYOUT: fixed column ordering for the entire display.
-//      walk main chain; at each splice add the spliced branch to
-//      LAYOUT, at each fork point add unspliced branches. this
+//   4. build LAYOUT: fixed column ordering for entire display.
+//      walk main chain; at each splice add the spliced branch (and
+//      its children) to LAYOUT. at each fork point add unspliced
+//      branches that fork from main (and their children). this
 //      determines MAX_COLS and the graph width for label alignment
 //   5. render top-to-bottom (newest first). walk main's chain:
 //      - at splice chambers: activate the branch column (add to
@@ -25,17 +29,18 @@
 //        mark branch in SHOWN so fission won't re-render commits
 //      - for each main chamber: render Φ in column 0, │ for alive
 //        columns, spaces for dead/removed columns
-//      - at fork points: for unspliced branches not in SHOWN,
-//        activate and render their exclusive commits first. then
-//        render ├►─┘ connector. deactivate column (remove from
-//        ALIVE). stale branches are silently skipped
+//      - at fork points: activate ALL non-shown branches first,
+//        then process columns outermost-to-innermost: walk each
+//        branch's exclusive commits (checking for nested fissions
+//        from child branches), render ├►─┘ connector with ├► at
+//        the parent branch's column, deactivate column
 //
 // column rendering per cell (2 chars each):
 //   commit line:  Φ  in commit column, │  for alive, spaces for dead
 //   splice line:  ├◄ at target (col 0), ┐  at source, ┼─ for alive
 //                 between, ── for dead between, │  past source
-//   fission line: ├► at source (col 0), ┘  at target (if alive),
-//                 ┼─ for alive between, ── for dead between
+//   fission line: ├► at source (parent col), ┘  at target, ┼─ for
+//                 alive between, ── for dead between
 //
 // key idiom: PARSE [ZERO_STR, NULL] X resets counter X per loop
 // iteration. IMPORT NUMBER is first-bind-only and won't re-fire.
@@ -78,15 +83,15 @@ TEXT "┼─" AS C_CROSS;
 TEXT "┘ " AS C_FORK_END;
 TEXT "┐ " AS C_SPLICE_END;
 
-// read HEAD reference and walk main's parent chain to collect chamber IDs
-READ ".ant/HEAD" AS HEAD_NAME;
-TRIM [HEAD_NAME, NULL] HEAD_NAME;
+// ===== PHASE 1: walk main's parent chain =====
+// trunk is always "main" so the graph is HEAD-independent
+
+TEXT "main" AS HEAD_NAME;
 TEXT ".ant/refs/" HEAD_NAME AS HEAD_REF;
 READ HEAD_REF AS HEAD_TIP;
 TRIM [HEAD_TIP, NULL] HEAD_TIP;
 PARSE [HEAD_TIP, NULL] TIP_NUM;
 GT [TIP_NUM, 0] HAS_CHAMBERS;
-// exit early if colony is empty
 CLONE HAS_CHAMBERS AS HCC;
 BRANCH(!HCC) {
     PRINT no chambers yet;
@@ -106,7 +111,6 @@ GT [MCN, 0] MWK;
     CONCAT [MAIN_LIST, MCUR] MAIN_LIST;
     CONCAT [MAIN_LIST, NL] MAIN_LIST;
 
-    // follow parent link
     TEXT ".ant/chambers/" MCUR "/parent" AS MPP;
     READ MPP AS MPAR;
     TRIM [MPAR, NULL] MPAR;
@@ -115,17 +119,15 @@ GT [MCN, 0] MWK;
     GT [MCN, 0] MWK;
 }
 
-// collect branch metadata: name, tip, fork point (first ancestor on main)
-// BRANCHES format: name\ttip\tfork\n...
-// stale branches (tip == fork) excluded since commits already on main
-TEXT "" AS BRANCHES;
+// ===== PHASE 2: collect branch metadata =====
+// BRANCHES_RAW: name\ttip\tfork_from_main\n
+TEXT "" AS BRANCHES_RAW;
 
 LISTDIR ".ant/refs" AS BREFS;
 ~ATH(BREFS) {
     BIFURCATE BREFS[BNAME, BREFS];
     CLONE BNAME AS BNC;
     BRANCH(BNC) {
-        // skip HEAD branch (processed separately)
         STREQ [BNAME, HEAD_NAME] IS_HD;
         CLONE IS_HD AS IHC;
         BRANCH(!IHC) {
@@ -136,12 +138,10 @@ LISTDIR ".ant/refs" AS BREFS;
             GT [BTN, 0] BVAL;
             CLONE BVAL AS BVC;
             BRANCH(BVC) {
-                // walk branch's parent chain until we hit main
                 TEXT "" BTIP AS BCUR;
                 TEXT "" BTIP AS BFORK;
                 BIFURCATE [BCUR, NULL] BWK;
 
-                // check if tip is already on main (immediate fork point)
                 TEXT PIPE BCUR PIPE AS BNEEDLE;
                 CONTAINS [MAIN_IDS, BNEEDLE] TON;
                 CLONE TON AS TONC;
@@ -161,7 +161,6 @@ LISTDIR ".ant/refs" AS BREFS;
                     BRANCH(!BCNTC) { BWK.DIE(); }
                     CLONE BWK AS BWKC;
                     BRANCH(BWKC) {
-                        // check if parent is on main (found fork point)
                         TEXT PIPE BCUR PIPE AS BN2;
                         CONTAINS [MAIN_IDS, BN2] ON2;
                         CLONE ON2 AS ON2C;
@@ -172,19 +171,102 @@ LISTDIR ".ant/refs" AS BREFS;
                     }
                 }
 
-                // record branch metadata if not stale (tip != fork)
-                CONCAT [BRANCHES, BNAME] BRANCHES;
-                CONCAT [BRANCHES, TAB] BRANCHES;
-                CONCAT [BRANCHES, BTIP] BRANCHES;
-                CONCAT [BRANCHES, TAB] BRANCHES;
-                CONCAT [BRANCHES, BFORK] BRANCHES;
-                CONCAT [BRANCHES, NL] BRANCHES;
+                CONCAT [BRANCHES_RAW, BNAME] BRANCHES_RAW;
+                CONCAT [BRANCHES_RAW, TAB] BRANCHES_RAW;
+                CONCAT [BRANCHES_RAW, BTIP] BRANCHES_RAW;
+                CONCAT [BRANCHES_RAW, TAB] BRANCHES_RAW;
+                CONCAT [BRANCHES_RAW, BFORK] BRANCHES_RAW;
+                CONCAT [BRANCHES_RAW, NL] BRANCHES_RAW;
             }
         }
     }
 }
 
-// scan main chambers for splice messages to map main_cid → branch_name
+// ===== PHASE 2b: resolve parent branches =====
+// for each branch, walk chain from tip. if a commit matches another
+// branch's TIP, that branch is the parent and the commit is the fork.
+// BRANCHES: name\ttip\tfork\tparent\n
+TEXT "" AS BRANCHES;
+TRIM [BRANCHES_RAW, NULL] TBRAW;
+SPLIT [TBRAW, NL] FXLINES;
+~ATH(FXLINES) {
+    BIFURCATE FXLINES[FXLINE, FXLINES];
+    CLONE FXLINE AS FXLC;
+    BRANCH(FXLC) {
+        SPLIT [FXLINE, TAB] FXPARTS;
+        BIFURCATE FXPARTS[FX_NAME, FXR1];
+        BIFURCATE FXR1[FX_TIP, FXR2];
+        BIFURCATE FXR2[FX_MFORK, FXR3];
+
+        TEXT "" HEAD_NAME AS FX_PARENT;
+        TEXT "" FX_MFORK AS FX_FORK;
+
+        TEXT "" FX_TIP AS FX_CUR;
+        BIFURCATE [FX_CUR, NULL] FX_WK;
+        STREQ [FX_CUR, FX_MFORK] FX_AF;
+        CLONE FX_AF AS FX_AFC;
+        BRANCH(FX_AFC) { FX_WK.DIE(); }
+        TEXT PIPE FX_CUR PIPE AS FX_MC;
+        CONTAINS [MAIN_IDS, FX_MC] FX_OM;
+        CLONE FX_OM AS FX_OMC;
+        BRANCH(FX_OMC) { FX_WK.DIE(); }
+
+        ~ATH(FX_WK) {
+            STREQ [FX_CUR, FX_MFORK] FX_DN;
+            CLONE FX_DN AS FX_DNC;
+            BRANCH(FX_DNC) { FX_WK.DIE(); }
+            CLONE FX_WK AS FX_WKA;
+            BRANCH(FX_WKA) {
+                // check if FX_CUR matches any other branch's tip
+                TRIM [BRANCHES_RAW, NULL] FX_TBR;
+                SPLIT [FX_TBR, NL] FX_TBRL;
+                ~ATH(FX_TBRL) {
+                    BIFURCATE FX_TBRL[FX_TBL, FX_TBRL];
+                    CLONE FX_TBL AS FX_TBLC;
+                    BRANCH(FX_TBLC) {
+                        SPLIT [FX_TBL, TAB] FX_TBP;
+                        BIFURCATE FX_TBP[FX_TBN, FX_TBR1];
+                        BIFURCATE FX_TBR1[FX_TBTIP, FX_TBR2];
+                        STREQ [FX_TBN, FX_NAME] FX_SELF;
+                        CLONE FX_SELF AS FX_SC;
+                        BRANCH(!FX_SC) {
+                            STREQ [FX_CUR, FX_TBTIP] FX_TIP_M;
+                            CLONE FX_TIP_M AS FX_TMC;
+                            BRANCH(FX_TMC) {
+                                TEXT "" FX_TBN AS FX_PARENT;
+                                TEXT "" FX_CUR AS FX_FORK;
+                                FX_WK.DIE();
+                            }
+                        }
+                    }
+                }
+
+                CLONE FX_WK AS FX_WKB;
+                BRANCH(FX_WKB) {
+                    TEXT ".ant/chambers/" FX_CUR "/parent" AS FX_PP;
+                    READ FX_PP AS FX_PAR;
+                    TRIM [FX_PAR, NULL] FX_PAR;
+                    TEXT "" FX_PAR AS FX_CUR;
+                    TEXT PIPE FX_CUR PIPE AS FX_MCK;
+                    CONTAINS [MAIN_IDS, FX_MCK] FX_OM2;
+                    CLONE FX_OM2 AS FX_OM2C;
+                    BRANCH(FX_OM2C) { FX_WK.DIE(); }
+                }
+            }
+        }
+
+        CONCAT [BRANCHES, FX_NAME] BRANCHES;
+        CONCAT [BRANCHES, TAB] BRANCHES;
+        CONCAT [BRANCHES, FX_TIP] BRANCHES;
+        CONCAT [BRANCHES, TAB] BRANCHES;
+        CONCAT [BRANCHES, FX_FORK] BRANCHES;
+        CONCAT [BRANCHES, TAB] BRANCHES;
+        CONCAT [BRANCHES, FX_PARENT] BRANCHES;
+        CONCAT [BRANCHES, NL] BRANCHES;
+    }
+}
+
+// ===== PHASE 3: scan main chambers for splice messages =====
 // SPLICES format: main_cid\tbranch_name\n...
 TEXT "" AS SPLICES;
 TEXT "splice tunnel '" AS SPLICE_PREFIX;
@@ -199,11 +281,9 @@ SPLIT [MAIN_LIST, NL] SMIDS;
         READ SMP AS SMSG;
         TRIM [SMSG, NULL] SMSG;
 
-        // check if message starts with "splice tunnel '"
         STARTSWITH [SMSG, SPLICE_PREFIX] IS_SPLICE;
         CLONE IS_SPLICE AS ISC;
         BRANCH(ISC) {
-            // match branch name in message against BRANCHES list
             TRIM [BRANCHES, NULL] TBRANCHES;
             SPLIT [TBRANCHES, NL] SBLINES;
             ~ATH(SBLINES) {
@@ -215,7 +295,6 @@ SPLIT [MAIN_LIST, NL] SMIDS;
                     CONTAINS [SMSG, SBN] SBMATCH;
                     CLONE SBMATCH AS SBMC;
                     BRANCH(SBMC) {
-                        // record splice: main chamber ID → branch name
                         CONCAT [SPLICES, SMID] SPLICES;
                         CONCAT [SPLICES, TAB] SPLICES;
                         CONCAT [SPLICES, SBN] SPLICES;
@@ -227,10 +306,10 @@ SPLIT [MAIN_LIST, NL] SMIDS;
     }
 }
 
-// build LAYOUT: fixed column ordering for entire display
+// ===== PHASE 4: build LAYOUT =====
 // LAYOUT format: main\tbranch1\tbranch2\t...
-// order: main (col 0), then branches as they appear: spliced branches at
-// splice chambers, unspliced branches at fork points. MAX_COLS sets graph width
+// when adding a branch, also add any children (branches whose parent
+// is that branch) so nested forks get adjacent columns
 TEXT HEAD_NAME TAB AS LAYOUT;
 IMPORT NUMBER 1 AS MAX_COLS;
 
@@ -255,11 +334,37 @@ SPLIT [MAIN_LIST, NL] LIDS;
                     CONCAT [LAYOUT, LSBN] LAYOUT;
                     CONCAT [LAYOUT, TAB] LAYOUT;
                     ADD [MAX_COLS, 1] MAX_COLS;
+
+                    // add children of this spliced branch
+                    TRIM [BRANCHES, NULL] LSC_BR;
+                    SPLIT [LSC_BR, NL] LSC_BRL;
+                    ~ATH(LSC_BRL) {
+                        BIFURCATE LSC_BRL[LSC_BL, LSC_BRL];
+                        CLONE LSC_BL AS LSC_BLC;
+                        BRANCH(LSC_BLC) {
+                            SPLIT [LSC_BL, TAB] LSC_BP;
+                            BIFURCATE LSC_BP[LSC_BN, LSC_BR1];
+                            BIFURCATE LSC_BR1[LSC_BT, LSC_BR2];
+                            BIFURCATE LSC_BR2[LSC_BF, LSC_BR3];
+                            BIFURCATE LSC_BR3[LSC_BPAR, LSC_BR4];
+                            STREQ [LSC_BPAR, LSBN] LSC_MATCH;
+                            CLONE LSC_MATCH AS LSC_MC;
+                            BRANCH(LSC_MC) {
+                                STREQ [LSC_BT, LSC_BF] LSC_STALE;
+                                CLONE LSC_STALE AS LSC_STC;
+                                BRANCH(!LSC_STC) {
+                                    CONCAT [LAYOUT, LSC_BN] LAYOUT;
+                                    CONCAT [LAYOUT, TAB] LAYOUT;
+                                    ADD [MAX_COLS, 1] MAX_COLS;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // add unspliced branches to LAYOUT at their fork point
+        // add unspliced branches that fork from main at this chamber
         TRIM [BRANCHES, NULL] TBRK;
         SPLIT [TBRK, NL] LBRK;
         ~ATH(LBRK) {
@@ -270,21 +375,50 @@ SPLIT [MAIN_LIST, NL] LIDS;
                 BIFURCATE LBPARTS[LBN, LBR1];
                 BIFURCATE LBR1[LBT, LBR2];
                 BIFURCATE LBR2[LBF, LBR3];
+                BIFURCATE LBR3[LBPAR, LBR4];
+                // only direct-from-main branches matched by fork == main chamber
                 STREQ [LBF, LID] LB_HERE;
                 CLONE LB_HERE AS LBHC;
                 BRANCH(LBHC) {
-                    // skip stale branches (tip == fork, commits already on main)
-                    STREQ [LBT, LBF] LB_STALE;
-                    CLONE LB_STALE AS LBSTC;
-                    BRANCH(!LBSTC) {
-                        // skip if already added as spliced branch
-                        TEXT TAB LBN TAB AS LBN_NDL;
-                        CONTAINS [SPLICES, LBN] LB_SPLICED;
-                        CLONE LB_SPLICED AS LBSPC;
-                        BRANCH(!LBSPC) {
-                            CONCAT [LAYOUT, LBN] LAYOUT;
-                            CONCAT [LAYOUT, TAB] LAYOUT;
-                            ADD [MAX_COLS, 1] MAX_COLS;
+                    STREQ [LBPAR, HEAD_NAME] LB_FROM_MAIN;
+                    CLONE LB_FROM_MAIN AS LB_FMC;
+                    BRANCH(LB_FMC) {
+                        STREQ [LBT, LBF] LB_STALE;
+                        CLONE LB_STALE AS LBSTC;
+                        BRANCH(!LBSTC) {
+                            CONTAINS [SPLICES, LBN] LB_SPLICED;
+                            CLONE LB_SPLICED AS LBSPC;
+                            BRANCH(!LBSPC) {
+                                CONCAT [LAYOUT, LBN] LAYOUT;
+                                CONCAT [LAYOUT, TAB] LAYOUT;
+                                ADD [MAX_COLS, 1] MAX_COLS;
+
+                                // add children of this branch
+                                TRIM [BRANCHES, NULL] LBC_BR;
+                                SPLIT [LBC_BR, NL] LBC_BRL;
+                                ~ATH(LBC_BRL) {
+                                    BIFURCATE LBC_BRL[LBC_BL, LBC_BRL];
+                                    CLONE LBC_BL AS LBC_BLC;
+                                    BRANCH(LBC_BLC) {
+                                        SPLIT [LBC_BL, TAB] LBC_BP;
+                                        BIFURCATE LBC_BP[LBC_BN, LBC_BR1];
+                                        BIFURCATE LBC_BR1[LBC_BT, LBC_BR2];
+                                        BIFURCATE LBC_BR2[LBC_BF, LBC_BR3];
+                                        BIFURCATE LBC_BR3[LBC_BPAR, LBC_BR4];
+                                        STREQ [LBC_BPAR, LBN] LBC_MATCH;
+                                        CLONE LBC_MATCH AS LBC_MC;
+                                        BRANCH(LBC_MC) {
+                                            STREQ [LBC_BT, LBC_BF] LBC_STALE;
+                                            CLONE LBC_STALE AS LBC_STC;
+                                            BRANCH(!LBC_STC) {
+                                                CONCAT [LAYOUT, LBC_BN] LAYOUT;
+                                                CONCAT [LAYOUT, TAB] LAYOUT;
+                                                ADD [MAX_COLS, 1] MAX_COLS;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -293,16 +427,68 @@ SPLIT [MAIN_LIST, NL] LIDS;
     }
 }
 
-// each column is 2 chars wide (Φ  or │  or spaces)
 ADD [MAX_COLS, MAX_COLS] GRAPH_WIDTH;
 
-// render top-to-bottom (newest first)
-// ALIVE: |branch1|branch2| tracks columns currently showing │ (active)
-// SHOWN: |branch1| tracks branches whose exclusive commits were already rendered
-TEXT "|" HEAD_NAME "|" AS ALIVE;
-TEXT "|" AS SHOWN;
+// ===== PHASE 2c: build COMMIT_MAP =====
+// maps each exclusive branch commit to its branch name
+// format: |cid\tbranch|cid\tbranch|...
+TEXT "|" AS COMMIT_MAP;
+TRIM [BRANCHES, NULL] CM_BR;
+SPLIT [CM_BR, NL] CM_BRL;
+~ATH(CM_BRL) {
+    BIFURCATE CM_BRL[CM_BL, CM_BRL];
+    CLONE CM_BL AS CM_BLC;
+    BRANCH(CM_BLC) {
+        SPLIT [CM_BL, TAB] CM_BP;
+        BIFURCATE CM_BP[CM_BN, CM_BR1];
+        BIFURCATE CM_BR1[CM_BT, CM_BR2];
+        BIFURCATE CM_BR2[CM_BF, CM_BR3];
 
-// render initial row: │ in active columns to start the graph
+        TEXT "" CM_BT AS CM_CUR;
+        BIFURCATE [CM_CUR, NULL] CM_WK;
+        STREQ [CM_CUR, CM_BF] CM_D1;
+        CLONE CM_D1 AS CM_D1C;
+        BRANCH(CM_D1C) { CM_WK.DIE(); }
+        TEXT PIPE CM_CUR PIPE AS CM_MN;
+        CONTAINS [MAIN_IDS, CM_MN] CM_OM;
+        CLONE CM_OM AS CM_OMC;
+        BRANCH(CM_OMC) { CM_WK.DIE(); }
+
+        ~ATH(CM_WK) {
+            STREQ [CM_CUR, CM_BF] CM_DN;
+            CLONE CM_DN AS CM_DNC;
+            BRANCH(CM_DNC) { CM_WK.DIE(); }
+            CLONE CM_WK AS CM_WKA;
+            BRANCH(CM_WKA) {
+                CONCAT [COMMIT_MAP, CM_CUR] COMMIT_MAP;
+                CONCAT [COMMIT_MAP, TAB] COMMIT_MAP;
+                CONCAT [COMMIT_MAP, CM_BN] COMMIT_MAP;
+                CONCAT [COMMIT_MAP, PIPE] COMMIT_MAP;
+
+                TEXT ".ant/chambers/" CM_CUR "/parent" AS CM_PP;
+                READ CM_PP AS CM_PAR;
+                TRIM [CM_PAR, NULL] CM_PAR;
+                TEXT "" CM_PAR AS CM_CUR;
+                TEXT PIPE CM_CUR PIPE AS CM_MCK;
+                CONTAINS [MAIN_IDS, CM_MCK] CM_OM2;
+                CLONE CM_OM2 AS CM_OM2C;
+                BRANCH(CM_OM2C) { CM_WK.DIE(); }
+            }
+        }
+    }
+}
+
+// ===== PHASE 5: render top-to-bottom (newest first) =====
+// branch commits interleaved with main by chamber ID (chronological)
+// branches activated at their tip, deactivated at fork (fission connector)
+TEXT "|" HEAD_NAME "|" AS ALIVE;
+
+// max chamber ID for gap upper bound
+READ ".ant/next_id" AS MAX_CID_STR;
+TRIM [MAX_CID_STR, NULL] MAX_CID_STR;
+PARSE [MAX_CID_STR, NULL] PREV_GAP;
+
+// render initial row
 SPLIT [LAYOUT, TAB] OLCOLS;
 ~ATH(OLCOLS) {
     BIFURCATE OLCOLS[OLC, OLCOLS];
@@ -322,8 +508,217 @@ SPLIT [MAIN_LIST, NL] RIDS;
     BIFURCATE RIDS[RID, RIDS];
     CLONE RID AS RIDC;
     BRANCH(RIDC) {
+        PARSE [RID, NULL] RID_NUM;
 
-        // check if this chamber is a splice point
+        // --- gap: render branch commits between PREV_GAP and RID ---
+        SUB [PREV_GAP, 1] GAP_I;
+        BIFURCATE [GAP_I, NULL] GAP_WK;
+        GT [GAP_I, RID_NUM] GAP_GO;
+        CLONE GAP_GO AS GAP_GOC;
+        BRANCH(!GAP_GOC) { GAP_WK.DIE(); }
+
+        ~ATH(GAP_WK) {
+            GT [GAP_I, RID_NUM] GAP_GO2;
+            CLONE GAP_GO2 AS GAP_GO2C;
+            BRANCH(!GAP_GO2C) { GAP_WK.DIE(); }
+            CLONE GAP_WK AS GAP_WKA;
+            BRANCH(GAP_WKA) {
+                TO_STRING [GAP_I, NULL] GAP_IS;
+                TEXT PIPE GAP_IS TAB AS GAP_NDL;
+                CONTAINS [COMMIT_MAP, GAP_NDL] GAP_HIT;
+                CLONE GAP_HIT AS GAP_HC;
+                BRANCH(GAP_HC) {
+                    // extract branch name from COMMIT_MAP
+                    TEXT "" AS GAP_BR;
+                    SPLIT [COMMIT_MAP, PIPE] GAP_ENTS;
+                    ~ATH(GAP_ENTS) {
+                        BIFURCATE GAP_ENTS[GAP_ENT, GAP_ENTS];
+                        CLONE GAP_ENT AS GAP_EC;
+                        BRANCH(GAP_EC) {
+                            SPLIT [GAP_ENT, TAB] GAP_EP;
+                            BIFURCATE GAP_EP[GAP_CID, GAP_ER1];
+                            BIFURCATE GAP_ER1[GAP_BN, GAP_ER2];
+                            STREQ [GAP_CID, GAP_IS] GAP_CM;
+                            CLONE GAP_CM AS GAP_CMC;
+                            BRANCH(GAP_CMC) { TEXT "" GAP_BN AS GAP_BR; }
+                        }
+                    }
+
+                    LENGTH [GAP_BR, NULL] GAP_BL;
+                    GT [GAP_BL, 0] GAP_HAS;
+                    CLONE GAP_HAS AS GAP_HASC;
+                    BRANCH(GAP_HASC) {
+                        BIFURCATE [GAP_BR, NULL] GAP_SHC;
+                        BRANCH(GAP_SHC) {
+
+                        // nested fission check: child branch forking here?
+                        TEXT "" AS NF_CHILD;
+                        TRIM [BRANCHES, NULL] NF_BR;
+                        SPLIT [NF_BR, NL] NF_BRL;
+                        ~ATH(NF_BRL) {
+                            BIFURCATE NF_BRL[NF_BL, NF_BRL];
+                            CLONE NF_BL AS NF_BLC;
+                            BRANCH(NF_BLC) {
+                                SPLIT [NF_BL, TAB] NF_BP;
+                                BIFURCATE NF_BP[NF_BN, NF_BR1];
+                                BIFURCATE NF_BR1[NF_BT, NF_BR2];
+                                BIFURCATE NF_BR2[NF_BF, NF_BR3];
+                                BIFURCATE NF_BR3[NF_BPAR, NF_BR4];
+                                STREQ [NF_BF, GAP_IS] NF_FK_M;
+                                CLONE NF_FK_M AS NF_FMC;
+                                BRANCH(NF_FMC) {
+                                    STREQ [NF_BPAR, GAP_BR] NF_PAR_M;
+                                    CLONE NF_PAR_M AS NF_PMC;
+                                    BRANCH(NF_PMC) {
+                                        STREQ [NF_BT, NF_BF] NF_STALE;
+                                        CLONE NF_STALE AS NF_STC;
+                                        BRANCH(!NF_STC) { TEXT "" NF_BN AS NF_CHILD; }
+                                    }
+                                }
+                            }
+                        }
+
+                        LENGTH [NF_CHILD, NULL] NF_CLEN;
+                        GT [NF_CLEN, 0] HAS_NF;
+                        CLONE HAS_NF AS HAS_NFC;
+                        BRANCH(HAS_NFC) {
+                            // find child and parent columns
+                            PARSE [ZERO_STR, NULL] NF_CI;
+                            PARSE [ZERO_STR, NULL] NF_CCOL;
+                            PARSE [ZERO_STR, NULL] NF_PCOL;
+                            SPLIT [LAYOUT, TAB] NF_LCOLS;
+                            ~ATH(NF_LCOLS) {
+                                BIFURCATE NF_LCOLS[NF_LC, NF_LCOLS];
+                                CLONE NF_LC AS NF_LCC;
+                                BRANCH(NF_LCC) {
+                                    STREQ [NF_LC, NF_CHILD] NF_LCM;
+                                    CLONE NF_LCM AS NF_LCMC;
+                                    BRANCH(NF_LCMC) { ADD [NF_CI, 0] NF_CCOL; }
+                                    STREQ [NF_LC, GAP_BR] NF_LPM;
+                                    CLONE NF_LPM AS NF_LPMC;
+                                    BRANCH(NF_LPMC) { ADD [NF_CI, 0] NF_PCOL; }
+                                    ADD [NF_CI, 1] NF_CI;
+                                }
+                            }
+
+                            // render nested fission connector
+                            PARSE [ZERO_STR, NULL] NF_FLI;
+                            SPLIT [LAYOUT, TAB] NF_FLCOLS;
+                            ~ATH(NF_FLCOLS) {
+                                BIFURCATE NF_FLCOLS[NF_FLC, NF_FLCOLS];
+                                CLONE NF_FLC AS NF_FLCC;
+                                BRANCH(NF_FLCC) {
+                                    EQ [NF_FLI, NF_PCOL] NF_IS_SRC;
+                                    CLONE NF_IS_SRC AS NF_ISC;
+                                    BRANCH(NF_ISC) { EMIT $C_FORK_SRC; }
+                                    ELSE {
+                                        EQ [NF_FLI, NF_CCOL] NF_IS_TGT;
+                                        CLONE NF_IS_TGT AS NF_ITC;
+                                        BRANCH(NF_ITC) {
+                                            TEXT PIPE NF_CHILD PIPE AS NF_TANDL;
+                                            CONTAINS [ALIVE, NF_TANDL] NF_TALV;
+                                            CLONE NF_TALV AS NF_TAC;
+                                            BRANCH(NF_TAC) { EMIT $C_FORK_END; }
+                                            ELSE { EMIT $C_SPC; }
+                                        }
+                                        ELSE {
+                                            GT [NF_FLI, NF_PCOL] NF_AFT_S;
+                                            GT [NF_CCOL, NF_FLI] NF_BEF_T;
+                                            CLONE NF_AFT_S AS NF_AFSC;
+                                            BRANCH(NF_AFSC) {
+                                                CLONE NF_BEF_T AS NF_BFTC;
+                                                BRANCH(NF_BFTC) {
+                                                    TEXT PIPE NF_FLC PIPE AS NF_FNDL;
+                                                    CONTAINS [ALIVE, NF_FNDL] NF_FUP;
+                                                    CLONE NF_FUP AS NF_FUPC;
+                                                    BRANCH(NF_FUPC) { EMIT $C_CROSS; }
+                                                    ELSE { EMIT $C_HLINE; }
+                                                }
+                                                ELSE {
+                                                    TEXT PIPE NF_FLC PIPE AS NF_FNDL2;
+                                                    CONTAINS [ALIVE, NF_FNDL2] NF_FUP2;
+                                                    CLONE NF_FUP2 AS NF_FUP2C;
+                                                    BRANCH(NF_FUP2C) { EMIT $C_BAR; }
+                                                    ELSE { EMIT $C_SPC; }
+                                                }
+                                            }
+                                            ELSE {
+                                                TEXT PIPE NF_FLC PIPE AS NF_FNDL3;
+                                                CONTAINS [ALIVE, NF_FNDL3] NF_FUP3;
+                                                CLONE NF_FUP3 AS NF_FUP3C;
+                                                BRANCH(NF_FUP3C) { EMIT $C_BAR; }
+                                                ELSE { EMIT $C_SPC; }
+                                            }
+                                        }
+                                    }
+                                    ADD [NF_FLI, 1] NF_FLI;
+                                }
+                            }
+                            TEXT "fission (" GAP_BR " → " NF_CHILD ")" AS NF_FLBL;
+                            PRINT $NF_FLBL;
+
+                            // deactivate child
+                            TEXT "|" AS NF_NALV;
+                            SPLIT [ALIVE, PIPE] NF_APARTS;
+                            ~ATH(NF_APARTS) {
+                                BIFURCATE NF_APARTS[NF_AP, NF_APARTS];
+                                CLONE NF_AP AS NF_APC;
+                                BRANCH(NF_APC) {
+                                    STREQ [NF_AP, NF_CHILD] NF_APM;
+                                    CLONE NF_APM AS NF_APMC;
+                                    BRANCH(!NF_APMC) {
+                                        CONCAT [NF_NALV, NF_AP] NF_NALV;
+                                        CONCAT [NF_NALV, PIPE] NF_NALV;
+                                    }
+                                }
+                            }
+                            TEXT "" NF_NALV AS ALIVE;
+                        }
+
+                        // activate branch if not yet active
+                        TEXT PIPE GAP_BR PIPE AS GAP_ANDL;
+                        CONTAINS [ALIVE, GAP_ANDL] GAP_ACT;
+                        CLONE GAP_ACT AS GAP_ACTC;
+                        BRANCH(!GAP_ACTC) {
+                            CONCAT [ALIVE, GAP_BR] ALIVE;
+                            CONCAT [ALIVE, PIPE] ALIVE;
+                        }
+
+                        // render branch commit
+                        TEXT ".ant/chambers/" GAP_IS "/message" AS GAP_MP;
+                        READ GAP_MP AS GAP_MSG;
+                        TRIM [GAP_MSG, NULL] GAP_MSG;
+
+                        PARSE [ZERO_STR, NULL] GAP_RI;
+                        SPLIT [LAYOUT, TAB] GAP_RCOLS;
+                        ~ATH(GAP_RCOLS) {
+                            BIFURCATE GAP_RCOLS[GAP_RC, GAP_RCOLS];
+                            CLONE GAP_RC AS GAP_RCC;
+                            BRANCH(GAP_RCC) {
+                                STREQ [GAP_RC, GAP_BR] GAP_RCM;
+                                CLONE GAP_RCM AS GAP_RCMC;
+                                BRANCH(GAP_RCMC) { EMIT $C_PHI; }
+                                ELSE {
+                                    TEXT PIPE GAP_RC PIPE AS GAP_RNDL;
+                                    CONTAINS [ALIVE, GAP_RNDL] GAP_RUP;
+                                    CLONE GAP_RUP AS GAP_RUPC;
+                                    BRANCH(GAP_RUPC) { EMIT $C_BAR; }
+                                    ELSE { EMIT $C_SPC; }
+                                }
+                                ADD [GAP_RI, 1] GAP_RI;
+                            }
+                        }
+                        TEXT GAP_IS " " GAP_BR ": " GAP_MSG AS GAP_LBL;
+                        PRINT $GAP_LBL;
+
+                        } // end !GAP_SHC (not shown)
+                    }
+                }
+                SUB [GAP_I, 1] GAP_I;
+            }
+        }
+
+        // --- splice handling ---
         TEXT "" AS SPLICE_BRANCH;
         TRIM [SPLICES, NULL] TSPLICES;
         SPLIT [TSPLICES, NL] SPLINES;
@@ -346,11 +741,10 @@ SPLIT [MAIN_LIST, NL] RIDS;
         GT [SBLEN, 0] HAS_SPLICE;
         CLONE HAS_SPLICE AS HSC;
         BRANCH(HSC) {
-            // activate the spliced branch column (add to ALIVE)
             CONCAT [ALIVE, SPLICE_BRANCH] ALIVE;
             CONCAT [ALIVE, PIPE] ALIVE;
 
-            // find which column the branch occupies
+            // find splice branch column
             PARSE [ZERO_STR, NULL] TARGET_COL;
             PARSE [ZERO_STR, NULL] SCOL_I;
             SPLIT [LAYOUT, TAB] SPCOLS;
@@ -367,8 +761,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                 }
             }
 
-            // render splice connector: ├◄ at col 0, ┐ at branch column,
-            // ┼─ for alive columns between, ── for dead between, │ past branch
+            // render splice connector: ├◄ at col 0, ┐ at branch column
             PARSE [ZERO_STR, NULL] SLI;
             SPLIT [LAYOUT, TAB] SLCOLS;
             ~ATH(SLCOLS) {
@@ -378,19 +771,18 @@ SPLIT [MAIN_LIST, NL] RIDS;
                     EQ [SLI, 0] SL_IS_TGT;
                     CLONE SL_IS_TGT AS SLTC;
                     BRANCH(SLTC) {
-                        EMIT $C_SPLICE_TGT;  // ├◄ at target (main, col 0)
+                        EMIT $C_SPLICE_TGT;
                     }
                     ELSE {
                         EQ [SLI, TARGET_COL] SL_IS_SRC;
                         CLONE SL_IS_SRC AS SLSC;
                         BRANCH(SLSC) {
-                            EMIT $C_SPLICE_END;  // ┐ at source (branch column)
+                            EMIT $C_SPLICE_END;
                         }
                         ELSE {
                             GT [SLI, TARGET_COL] SL_PAST;
                             CLONE SL_PAST AS SLPC;
                             BRANCH(!SLPC) {
-                                // between target and source: ┼─ if alive, ── if dead
                                 TEXT PIPE SLCOL PIPE AS SL_NDL;
                                 CONTAINS [ALIVE, SL_NDL] SL_UP;
                                 CLONE SL_UP AS SLUC;
@@ -398,7 +790,6 @@ SPLIT [MAIN_LIST, NL] RIDS;
                                 ELSE { EMIT $C_HLINE; }
                             }
                             ELSE {
-                                // past source: │ if alive, spaces if dead
                                 TEXT PIPE SLCOL PIPE AS SL_NDL2;
                                 CONTAINS [ALIVE, SL_NDL2] SL_UP2;
                                 CLONE SL_UP2 AS SLUC2;
@@ -412,102 +803,13 @@ SPLIT [MAIN_LIST, NL] RIDS;
             }
             TEXT "splice (" HEAD_NAME " ← " SPLICE_BRANCH ")" AS SPLABEL;
             PRINT $SPLABEL;
-
-            // walk branch's exclusive commits (tip to fork point)
-            TRIM [BRANCHES, NULL] TBRANCHES2;
-            SPLIT [TBRANCHES2, NL] BXLINES;
-            TEXT "" AS BX_TIP;
-            TEXT "" AS BX_FORK;
-            ~ATH(BXLINES) {
-                BIFURCATE BXLINES[BXLINE, BXLINES];
-                CLONE BXLINE AS BXLC;
-                BRANCH(BXLC) {
-                    SPLIT [BXLINE, TAB] BXPARTS;
-                    BIFURCATE BXPARTS[BXN, BXR1];
-                    BIFURCATE BXR1[BXT, BXR2];
-                    BIFURCATE BXR2[BXF, BXR3];
-                    STREQ [BXN, SPLICE_BRANCH] BXMATCH;
-                    CLONE BXMATCH AS BXMC;
-                    BRANCH(BXMC) {
-                        TEXT "" BXT AS BX_TIP;
-                        TEXT "" BXF AS BX_FORK;
-                    }
-                }
-            }
-
-            TEXT "" BX_TIP AS BXCUR;
-            BIFURCATE [BXCUR, NULL] BXWK;
-
-            // stop if already at fork point
-            STREQ [BXCUR, BX_FORK] BX_AT_FK;
-            CLONE BX_AT_FK AS BXAFC;
-            BRANCH(BXAFC) { BXWK.DIE(); }
-
-            // stop if current commit is on main chain
-            TEXT PIPE BXCUR PIPE AS BXN_CHK;
-            CONTAINS [MAIN_IDS, BXN_CHK] BX_ON_M;
-            CLONE BX_ON_M AS BXOMC;
-            BRANCH(BXOMC) { BXWK.DIE(); }
-
-            ~ATH(BXWK) {
-                STREQ [BXCUR, BX_FORK] BXDONE;
-                CLONE BXDONE AS BXDC;
-                BRANCH(BXDC) { BXWK.DIE(); }
-
-                CLONE BXWK AS BXWKA;
-                BRANCH(BXWKA) {
-                    TEXT ".ant/chambers/" BXCUR "/message" AS BXMP;
-                    READ BXMP AS BXMSG;
-                    TRIM [BXMSG, NULL] BXMSG;
-
-                    // render commit line: Φ in branch column, │ or spaces elsewhere
-                    PARSE [ZERO_STR, NULL] BXI;
-                    SPLIT [LAYOUT, TAB] BXCOLS;
-                    ~ATH(BXCOLS) {
-                        BIFURCATE BXCOLS[BXCOL, BXCOLS];
-                        CLONE BXCOL AS BXCOLC;
-                        BRANCH(BXCOLC) {
-                            STREQ [BXCOL, SPLICE_BRANCH] BX_IS_ME;
-                            CLONE BX_IS_ME AS BXIMC;
-                            BRANCH(BXIMC) { EMIT $C_PHI; }
-                            ELSE {
-                                TEXT PIPE BXCOL PIPE AS BX_NDL;
-                                CONTAINS [ALIVE, BX_NDL] BX_UP;
-                                CLONE BX_UP AS BXUC;
-                                BRANCH(BXUC) { EMIT $C_BAR; }
-                                ELSE { EMIT $C_SPC; }
-                            }
-                            ADD [BXI, 1] BXI;
-                        }
-                    }
-                    TEXT BXCUR " " SPLICE_BRANCH ": " BXMSG AS BXLABEL;
-                    PRINT $BXLABEL;
-
-                    // follow parent link
-                    TEXT ".ant/chambers/" BXCUR "/parent" AS BXPP;
-                    READ BXPP AS BXPAR;
-                    TRIM [BXPAR, NULL] BXPAR;
-                    TEXT "" BXPAR AS BXCUR;
-
-                    // stop if parent is on main chain
-                    TEXT PIPE BXCUR PIPE AS BXNCK;
-                    CONTAINS [MAIN_IDS, BXNCK] BXONM2;
-                    CLONE BXONM2 AS BXOM2C;
-                    BRANCH(BXOM2C) { BXWK.DIE(); }
-                }
-            }
-
-            // mark branch as shown so fission won't re-render these commits
-            CONCAT [SHOWN, SPLICE_BRANCH] SHOWN;
-            CONCAT [SHOWN, PIPE] SHOWN;
         }
 
-        // render the main chamber commit
+        // --- render main chamber commit ---
         TEXT ".ant/chambers/" RID "/message" AS RMP;
         READ RMP AS RMSG;
         TRIM [RMSG, NULL] RMSG;
 
-        // append chamber name if present
         TEXT "" AS RNAME;
         TEXT ".ant/chambers/" RID "/name" AS RNP;
         EXISTS RNP AS HAS_NM;
@@ -518,7 +820,6 @@ SPLIT [MAIN_LIST, NL] RIDS;
             TEXT " (" RNVAL ")" AS RNAME;
         }
 
-        // render commit line: Φ in col 0 (main), │ for alive, spaces for dead
         PARSE [ZERO_STR, NULL] RI;
         SPLIT [LAYOUT, TAB] RCOLS;
         ~ATH(RCOLS) {
@@ -541,114 +842,42 @@ SPLIT [MAIN_LIST, NL] RIDS;
         TEXT RID " " HEAD_NAME RNAME ": " RMSG AS RLABEL;
         PRINT $RLABEL;
 
-        // check if any branches fork at this chamber
-        TRIM [BRANCHES, NULL] TBRANCHES3;
-        SPLIT [TBRANCHES3, NL] FKLINES;
-        ~ATH(FKLINES) {
-            BIFURCATE FKLINES[FKLINE, FKLINES];
-            CLONE FKLINE AS FKLC;
-            BRANCH(FKLC) {
-                SPLIT [FKLINE, TAB] FKPARTS;
-                BIFURCATE FKPARTS[FKN, FKR1];
-                BIFURCATE FKR1[FKT, FKR2];
-                BIFURCATE FKR2[FKF, FKR3];
-                STREQ [FKF, RID] FK_HERE;
-                CLONE FK_HERE AS FKHC;
-                BRANCH(FKHC) {
-                    // skip stale branches (tip == fork)
-                    STREQ [FKT, FKF] FK_STALE;
-                    CLONE FK_STALE AS FKSC;
-                    BRANCH(!FKSC) {
+        // --- fission connectors at fork point ---
+        // column-descending: render connectors + deactivate (commits already rendered in gap)
+        ADD [MAX_COLS, 0] FK_CI;
+        BIFURCATE [FK_CI, NULL] FK_CWK;
+        GT [FK_CI, 0] FK_CGO;
+        CLONE FK_CGO AS FK_CGOC;
+        BRANCH(!FK_CGOC) { FK_CWK.DIE(); }
 
-                    // if unspliced and not shown, render exclusive commits first
-                    TEXT PIPE FKN PIPE AS FK_SH_NDL;
-                    CONTAINS [SHOWN, FK_SH_NDL] FK_WAS_SHOWN;
-                    CLONE FK_WAS_SHOWN AS FKWSC;
-                    BRANCH(!FKWSC) {
-                        // activate unspliced branch column
-                        CONCAT [ALIVE, FKN] ALIVE;
-                        CONCAT [ALIVE, PIPE] ALIVE;
+        ~ATH(FK_CWK) {
+            GT [FK_CI, 0] FK_CGO2;
+            CLONE FK_CGO2 AS FK_CGO2C;
+            BRANCH(!FK_CGO2C) { FK_CWK.DIE(); }
 
-                        TEXT "" AS UX_TIP;
-                        TEXT "" AS UX_FORK;
-                        TRIM [BRANCHES, NULL] TBR4;
-                        SPLIT [TBR4, NL] UXBL;
-                        ~ATH(UXBL) {
-                            BIFURCATE UXBL[UXBL1, UXBL];
-                            CLONE UXBL1 AS UXBLC;
-                            BRANCH(UXBLC) {
-                                SPLIT [UXBL1, TAB] UXBP;
-                                BIFURCATE UXBP[UXBN, UXBR1];
-                                BIFURCATE UXBR1[UXBT, UXBR2];
-                                BIFURCATE UXBR2[UXBF, UXBR3];
-                                STREQ [UXBN, FKN] UXBM;
-                                CLONE UXBM AS UXBMC;
-                                BRANCH(UXBMC) {
-                                    TEXT "" UXBT AS UX_TIP;
-                                    TEXT "" UXBF AS UX_FORK;
-                                }
-                            }
-                        }
+            CLONE FK_CWK AS FK_CWKA;
+            BRANCH(FK_CWKA) {
+                TRIM [BRANCHES, NULL] FK_TBR;
+                SPLIT [FK_TBR, NL] FK_BRL;
+                ~ATH(FK_BRL) {
+                    BIFURCATE FK_BRL[FK_BL, FK_BRL];
+                    CLONE FK_BL AS FK_BLC;
+                    BRANCH(FK_BLC) {
+                        SPLIT [FK_BL, TAB] FK_BP;
+                        BIFURCATE FK_BP[FKN, FK_BR1];
+                        BIFURCATE FK_BR1[FKT, FK_BR2];
+                        BIFURCATE FK_BR2[FKF, FK_BR3];
+                        BIFURCATE FK_BR3[FK_PAR, FK_BR4];
+                        STREQ [FKF, RID] FK_HERE;
+                        CLONE FK_HERE AS FK_HC;
+                        BRANCH(FK_HC) {
+                            STREQ [FK_PAR, HEAD_NAME] FK_FM;
+                            CLONE FK_FM AS FK_FMC;
+                            BRANCH(FK_FMC) {
+                                STREQ [FKT, FKF] FK_STALE;
+                                CLONE FK_STALE AS FK_STC;
+                                BRANCH(!FK_STC) {
 
-                        TEXT "" UX_TIP AS UXCUR;
-                        BIFURCATE [UXCUR, NULL] UXWK;
-                        // stop if tip is on main or already at fork
-                        TEXT PIPE UXCUR PIPE AS UXN1;
-                        CONTAINS [MAIN_IDS, UXN1] UX1;
-                        CLONE UX1 AS UX1C;
-                        BRANCH(UX1C) { UXWK.DIE(); }
-                        STREQ [UXCUR, UX_FORK] UX2;
-                        CLONE UX2 AS UX2C;
-                        BRANCH(UX2C) { UXWK.DIE(); }
-
-                        ~ATH(UXWK) {
-                            STREQ [UXCUR, UX_FORK] UXDN;
-                            CLONE UXDN AS UXDNC;
-                            BRANCH(UXDNC) { UXWK.DIE(); }
-                            CLONE UXWK AS UXWKA;
-                            BRANCH(UXWKA) {
-                                TEXT ".ant/chambers/" UXCUR "/message" AS UXMP;
-                                READ UXMP AS UXMSG;
-                                TRIM [UXMSG, NULL] UXMSG;
-
-                                // render commit line for unspliced branch
-                                PARSE [ZERO_STR, NULL] UXI;
-                                SPLIT [LAYOUT, TAB] UXCOLS;
-                                ~ATH(UXCOLS) {
-                                    BIFURCATE UXCOLS[UXCOL, UXCOLS];
-                                    CLONE UXCOL AS UXCOLC;
-                                    BRANCH(UXCOLC) {
-                                        STREQ [UXCOL, FKN] UX_ME;
-                                        CLONE UX_ME AS UXMEC;
-                                        BRANCH(UXMEC) { EMIT $C_PHI; }
-                                        ELSE {
-                                            TEXT PIPE UXCOL PIPE AS UX_NDL;
-                                            CONTAINS [ALIVE, UX_NDL] UX_UP;
-                                            CLONE UX_UP AS UXUPC;
-                                            BRANCH(UXUPC) { EMIT $C_BAR; }
-                                            ELSE { EMIT $C_SPC; }
-                                        }
-                                        ADD [UXI, 1] UXI;
-                                    }
-                                }
-                                TEXT UXCUR " " FKN ": " UXMSG AS UXLBL;
-                                PRINT $UXLBL;
-
-                                // follow parent link
-                                TEXT ".ant/chambers/" UXCUR "/parent" AS UXPP;
-                                READ UXPP AS UXPAR;
-                                TRIM [UXPAR, NULL] UXPAR;
-                                TEXT "" UXPAR AS UXCUR;
-                                // stop if parent is on main
-                                TEXT PIPE UXCUR PIPE AS UXNCK;
-                                CONTAINS [MAIN_IDS, UXNCK] UXONM;
-                                CLONE UXONM AS UXONMC;
-                                BRANCH(UXONMC) { UXWK.DIE(); }
-                            }
-                        }
-                    }
-
-                    // find which column the forked branch occupies
                     PARSE [ZERO_STR, NULL] FKI;
                     PARSE [ZERO_STR, NULL] FK_COL;
                     SPLIT [LAYOUT, TAB] FKCOLS;
@@ -663,12 +892,13 @@ SPLIT [MAIN_LIST, NL] RIDS;
                         }
                     }
 
-                    // check if branch column is alive (showing │)
+                    EQ [FK_COL, FK_CI] FK_AT_PASS;
+                    CLONE FK_AT_PASS AS FK_APC;
+                    BRANCH(FK_APC) {
+
                     TEXT PIPE FKN PIPE AS FK_A_NDL;
                     CONTAINS [ALIVE, FK_A_NDL] FK_IS_ALIVE;
 
-                    // render fission connector: ├► at col 0, ┘ at branch (if alive),
-                    // ┼─ for alive between, ── for dead between, │ past branch
                     PARSE [ZERO_STR, NULL] FLI;
                     SPLIT [LAYOUT, TAB] FLCOLS;
                     ~ATH(FLCOLS) {
@@ -677,35 +907,32 @@ SPLIT [MAIN_LIST, NL] RIDS;
                         BRANCH(FLCC) {
                             EQ [FLI, 0] FL_IS_SRC;
                             CLONE FL_IS_SRC AS FLSC;
-                            BRANCH(FLSC) { EMIT $C_FORK_SRC; }  // ├► at source (main, col 0)
+                            BRANCH(FLSC) { EMIT $C_FORK_SRC; }
                             ELSE {
-                                GT [FLI, FK_COL] FL_PAST;
-                                CLONE FL_PAST AS FLPC;
-                                BRANCH(!FLPC) {
-                                    EQ [FLI, FK_COL] FL_IS_TGT;
-                                    CLONE FL_IS_TGT AS FLTC;
-                                    BRANCH(FLTC) {
-                                        // ┘ at target only if branch was alive
-                                        CLONE FK_IS_ALIVE AS FKIAC;
-                                        BRANCH(FKIAC) { EMIT $C_FORK_END; }
-                                        ELSE { EMIT $C_SPC; }
-                                    }
-                                    ELSE {
-                                        // between source and target: ┼─ if alive, ── if dead
+                                EQ [FLI, FK_COL] FL_IS_TGT;
+                                CLONE FL_IS_TGT AS FLTC;
+                                BRANCH(FLTC) {
+                                    CLONE FK_IS_ALIVE AS FKIAC;
+                                    BRANCH(FKIAC) { EMIT $C_FORK_END; }
+                                    ELSE { EMIT $C_SPC; }
+                                }
+                                ELSE {
+                                    GT [FLI, FK_COL] FL_PAST;
+                                    CLONE FL_PAST AS FLPC;
+                                    BRANCH(!FLPC) {
                                         TEXT PIPE FLCOL PIPE AS FL_NDL;
                                         CONTAINS [ALIVE, FL_NDL] FL_UP;
                                         CLONE FL_UP AS FLUC;
                                         BRANCH(FLUC) { EMIT $C_CROSS; }
                                         ELSE { EMIT $C_HLINE; }
                                     }
-                                }
-                                ELSE {
-                                    // past target: │ if alive, spaces if dead
-                                    TEXT PIPE FLCOL PIPE AS FL_NDL2;
-                                    CONTAINS [ALIVE, FL_NDL2] FL_UP2;
-                                    CLONE FL_UP2 AS FLUC2;
-                                    BRANCH(FLUC2) { EMIT $C_BAR; }
-                                    ELSE { EMIT $C_SPC; }
+                                    ELSE {
+                                        TEXT PIPE FLCOL PIPE AS FL_NDL2;
+                                        CONTAINS [ALIVE, FL_NDL2] FL_UP2;
+                                        CLONE FL_UP2 AS FLUC2;
+                                        BRANCH(FLUC2) { EMIT $C_BAR; }
+                                        ELSE { EMIT $C_SPC; }
+                                    }
                                 }
                             }
                             ADD [FLI, 1] FLI;
@@ -714,30 +941,34 @@ SPLIT [MAIN_LIST, NL] RIDS;
                     TEXT "fission (" HEAD_NAME " → " FKN ")" AS FKLABEL;
                     PRINT $FKLABEL;
 
-                    // deactivate branch column (remove from ALIVE)
-                    TEXT "" AS NEW_ALIVE2;
-                    TEXT PIPE AS NA2_P;
-                    CONCAT [NEW_ALIVE2, NA2_P] NEW_ALIVE2;
-                    // rebuild ALIVE without the forked branch
-                    SPLIT [ALIVE, PIPE] APARTS2;
-                    ~ATH(APARTS2) {
-                        BIFURCATE APARTS2[AP2, APARTS2];
-                        CLONE AP2 AS AP2C;
-                        BRANCH(AP2C) {
-                            STREQ [AP2, FKN] AP2_MATCH;
-                            CLONE AP2_MATCH AS AP2MC;
-                            BRANCH(!AP2MC) {
-                                CONCAT [NEW_ALIVE2, AP2] NEW_ALIVE2;
-                                CONCAT [NEW_ALIVE2, PIPE] NEW_ALIVE2;
+                    TEXT "|" AS NEW_ALIVE;
+                    SPLIT [ALIVE, PIPE] APARTS;
+                    ~ATH(APARTS) {
+                        BIFURCATE APARTS[AP, APARTS];
+                        CLONE AP AS APC;
+                        BRANCH(APC) {
+                            STREQ [AP, FKN] AP_MATCH;
+                            CLONE AP_MATCH AS APMC;
+                            BRANCH(!APMC) {
+                                CONCAT [NEW_ALIVE, AP] NEW_ALIVE;
+                                CONCAT [NEW_ALIVE, PIPE] NEW_ALIVE;
                             }
                         }
                     }
-                    TEXT "" NEW_ALIVE2 AS ALIVE;
+                    TEXT "" NEW_ALIVE AS ALIVE;
 
-                    }
+                    } // end FK_AT_PASS
+                    } // end !FK_STALE
+                    } // end FK_FM
+                    } // end FK_HERE
                 }
             }
+
+                SUB [FK_CI, 1] FK_CI;
+            }
         }
+
+        ADD [RID_NUM, 0] PREV_GAP;
     }
 }
 
