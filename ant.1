@@ -1,0 +1,174 @@
+.TH ANT 1 "2026-06-19" "ant 1.0" "~ANT Manual"
+.SH NAME
+ant \- distributed version control written in ~ATH
+.SH SYNOPSIS
+.B ant
+.I command
+.RI [ args... ]
+.SH DESCRIPTION
+.B ant
+is a colony-themed version control system written in the ~ATH esoteric
+language. It tracks files as snapshots in chambers (commits), organized
+by tunnels (branches). Remote storage is provided by a ~colony server.
+.PP
+All state lives in
+.B .ant/
+at the working directory root.
+.SH COMMANDS
+.SS Initialization
+.TP
+.B ant hatch
+Initialize a new colony. Creates the
+.B .ant/
+scaffold with HEAD pointing to
+.IR main ,
+empty forage pile, chamber storage, and id counter. Aborts if
+.B .ant
+already exists.
+.SS Staging and Committing
+.TP
+.BI "ant collect " file
+Stage a file to the forage pile for the next commit. Prints a warning
+if the file is already staged.
+.TP
+.BI "ant dig " "message " [ name ]
+Commit all foraged files into a new chamber. Allocates a chamber id,
+stores each staged file as a numbered blob, writes the manifest, updates
+the current tunnel ref, and clears the forage pile. Aborts if the
+forage pile is empty. If
+.I name
+is given, the chamber is tagged with that name for later reference.
+.SS History
+.TP
+.B ant log
+Walk chamber history backwards from HEAD to root.
+Prints chamber id, optional name, and commit message.
+.TP
+.B ant trail
+Display colony history as a column-based ASCII graph, newest first.
+Renders commits, splice merges, and fission forks with column connectors.
+.TP
+.B ant status
+Show current tunnel name, forage pile contents, and modified or deleted
+files relative to the HEAD chamber. Prints "working tree clean" if
+nothing has changed.
+.TP
+.B ant diff
+Line-by-line diff of working tree files against the HEAD chamber snapshot.
+Marks deleted files. Exits early if no chambers exist.
+.SS Branching
+.TP
+.B ant fission
+List all tunnels. The current tunnel is marked with
+.BR * .
+.TP
+.BI "ant fission " name
+Create a new tunnel at the current HEAD. Does not switch to it.
+.TP
+.BI "ant fission " "name ref"
+Create a new tunnel at chamber
+.IR ref ,
+switch HEAD to it, clear the forage pile, and restore the working tree.
+.I ref
+may be a numeric chamber id or a chamber name set by
+.BR dig .
+.TP
+.BI "ant tunnel " name
+Switch to an existing tunnel. Updates HEAD and restores the working tree
+from the tunnel's tip chamber.
+.SS Merging
+.TP
+.BI "ant splice " branch
+Three-way merge of
+.I branch
+into the current tunnel. Walks both histories to find a common ancestor.
+Per-file merge rules:
+.RS
+.IP \(bu 2
+Only ours changed \(em keep ours.
+.IP \(bu 2
+Only theirs changed \(em take theirs.
+.IP \(bu 2
+Both changed \(em write conflict markers
+.RB ( <<<<<<< " / " ======= " / " >>>>>>> ).
+.IP \(bu 2
+File only in theirs \(em added.
+.RE
+.IP
+Conflicts are written to the working tree. Resolve manually, then
+.B collect
+and
+.BR dig .
+.SS Copying
+.TP
+.BI "ant transplant " "src " [ dst ]
+Copy a colony to a new location. Defaults to
+.IR src -colony
+if
+.I dst
+is omitted. Copies all refs, chambers, and metadata, then restores
+the working tree at the destination.
+.SS Networking
+Push and pull require a running ~colony server.
+.TP
+.BI "ant deliver " "host port colony-id password"
+Push all local state (HEAD, refs, chambers) to the remote server.
+First connection with an unknown colony-id registers it; subsequent
+connections must match the password.
+.TP
+.BI "ant gather " "host port colony-id password"
+Pull remote state from the server and restore the working tree.
+Creates the
+.B .ant/
+scaffold if missing.
+.SH STORAGE
+.nf
+\&.ant/
+  HEAD          current tunnel name
+  next_id       monotonic chamber counter
+  forage        staged filenames, newline-separated
+  refs/<name>   tunnel \(-> chamber id
+  chambers/<id>/
+    parent      parent chamber id (0 = root)
+    message     commit message
+    name        optional chamber name
+    files       manifest of tracked filenames
+    0, 1, ...   file blobs indexed to manifest order
+.fi
+.PP
+Chamber id 0 is the root sentinel. Ids increment from 1.
+.SH REVERTING
+There is no destructive reset. Use
+.B fission
+to branch from any historical chamber:
+.PP
+.nf
+ant log                        # find target chamber id
+ant fission rollback 3         # branch at chamber 3
+ant fission rollback v1.0      # branch at named chamber
+.fi
+.PP
+Previous work is preserved \(em the old tunnel still points at its tip.
+.SH MERGE CONFLICTS
+Conflicting files are written with standard conflict markers:
+.PP
+.nf
+<<<<<<< ours
+(your version)
+=======
+(their version)
+>>>>>>> theirs
+.fi
+.PP
+Edit the file to resolve, then
+.B ant collect
+and
+.BR "ant dig" .
+.SH EXIT STATUS
+.B ant
+exits 0 on success. Nonzero on error (missing arguments, no colony,
+empty forage pile, unknown tunnel, etc.).
+.SH SEE ALSO
+.BR athc (1)
+.SH AUTHORS
+Laika Klingbeil
