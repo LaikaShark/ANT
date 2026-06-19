@@ -1,5 +1,20 @@
-// ant diff — compare working tree against cumulative HEAD snapshot
-// walks parent chain to build full file map, then diffs each file
+// ant diff — compares working tree against the cumulative HEAD snapshot
+//
+// algorithm:
+//   read HEAD tunnel ref to get current tip chamber id
+//   build cumulative file map by walking the parent chain from tip to root:
+//     at each chamber, read its manifest (list of filenames)
+//     for each filename not already seen, record name\tcid\tidx
+//     the first occurrence (nearest to tip) wins — later ancestors are shadowed
+//     SEEN is a pipe-delimited string for O(n) dedup via CONTAINS
+//     WIDX resets per chamber via PARSE (IMPORT is first-bind-only)
+//   for each entry in the file map:
+//     read the blob from .ant/chambers/<cid>/<idx>
+//     if the file exists on disk, compare content via STREQ
+//     if different, print a line-by-line lockstep diff (not unified)
+//     if the file is missing from disk, print "(deleted)"
+//
+// TRIM before SPLIT strips trailing NL to avoid processing an empty final entry
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <split> AS SPLIT;
@@ -12,12 +27,14 @@ IMPORTF <gt> AS GT;
 IMPORTF <add> AS ADD;
 IMPORTF <to_string> AS TO_STRING;
 
+// read HEAD tunnel ref to get current tip chamber id
 READ ".ant/HEAD" AS TNAME;
 TRIM [TNAME, NULL] TNAME;
 TEXT ".ant/refs/" TNAME AS REF_PATH;
 READ REF_PATH AS CID;
 TRIM [CID, NULL] CID;
 
+// exit early if no chambers exist yet
 PARSE [CID, NULL] CID_NUM;
 GT [CID_NUM, 0] HAS_CHAMBER;
 CLONE HAS_CHAMBER AS HC;
@@ -26,38 +43,51 @@ BRANCH(!HC) {
     THIS.DIE();
 }
 
-// ── build cumulative file map by walking parent chain ──
-// FILE_MAP: "filename\tcid\tidx\n..."
-// SEEN: "|filename1|filename2|..." for dedup
+// build cumulative file map by walking parent chain from tip to root
+// FILE_MAP holds "filename\tcid\tidx\n..." entries
+// SEEN holds "|filename1|filename2|..." for O(n) dedup via CONTAINS
 
+// initialize map-building state
 TEXT "|" AS PIPE;
 TEXT "\t" AS TAB;
 TEXT "\n" AS NL;
-TEXT "" AS FILE_MAP;
-TEXT "|" AS SEEN;
-TEXT "0" AS ZERO_STR;
-TEXT "" CID AS WALK_CUR;
+TEXT "" AS FILE_MAP;  // accumulates filename\tcid\tidx entries
+TEXT "|" AS SEEN;     // pipe-delimited dedup tracker
+TEXT "0" AS ZERO_STR; // for PARSE reset (IMPORT is first-bind-only)
+TEXT "" CID AS WALK_CUR; // start walk at tip chamber id
 
+// walk parent chain while current chamber id > 0
 PARSE [WALK_CUR, NULL] WN;
 GT [WN, 0] WALKING;
 ~ATH(WALKING) {
+    // process current chamber
+    // read this chamber's manifest (newline-separated filenames)
     TEXT ".ant/chambers/" WALK_CUR "/files" AS WMPATH;
     READ WMPATH AS WMAN;
     TRIM [WMAN, NULL] WMAN;
 
+    // split manifest into filename list
     SPLIT [WMAN, NL] WFILES;
+    // reset blob index counter for this chamber (PARSE creates fresh binding)
     PARSE [ZERO_STR, NULL] WIDX;
+    // iterate over filenames in this chamber
     ~ATH(WFILES) {
+        // pop next filename from list
         BIFURCATE WFILES[WFNAME, WFILES];
+        // skip empty entries (from trailing newline)
         LENGTH [WFNAME, NULL] WFLEN;
         BRANCH(WFLEN) {
+            // check if filename already recorded (first occurrence wins)
             TEXT PIPE WFNAME PIPE AS WNEEDLE;
             CONTAINS [SEEN, WNEEDLE] WSEEN;
             CLONE WSEEN AS WSC;
             BRANCH(!WSC) {
+                // new filename — record it in map and dedup tracker
+                // add to dedup tracker
                 CONCAT [SEEN, WFNAME] SEEN;
                 CONCAT [SEEN, PIPE] SEEN;
 
+                // add entry to file map: filename\tcid\tidx\n
                 TO_STRING [WIDX, NULL] WIDX_S;
                 CONCAT [FILE_MAP, WFNAME] FILE_MAP;
                 CONCAT [FILE_MAP, TAB] FILE_MAP;
@@ -66,67 +96,85 @@ GT [WN, 0] WALKING;
                 CONCAT [FILE_MAP, WIDX_S] FILE_MAP;
                 CONCAT [FILE_MAP, NL] FILE_MAP;
             }
+            // increment blob index (every filename in manifest has a blob)
             ADD [WIDX, 1] WIDX;
         }
     }
 
+    // advance to parent chamber
     TEXT ".ant/chambers/" WALK_CUR "/parent" AS WPPATH;
     READ WPPATH AS WPAR;
     TRIM [WPAR, NULL] WPAR;
-    TEXT "" WPAR AS WALK_CUR;
-    PARSE [WALK_CUR, NULL] WN;
-    GT [WN, 0] WALKING;
+    TEXT "" WPAR AS WALK_CUR; // copy parent id into walk cursor
+    PARSE [WALK_CUR, NULL] WN; // parse new chamber id
+    GT [WN, 0] WALKING;        // continue if parent id > 0
 }
 
-// ── diff each tracked file against working tree ──
+// diff each tracked file against working tree
 
 TRIM [FILE_MAP, NULL] FILE_MAP;
 SPLIT [FILE_MAP, NL] FMLINES;
+// iterate over file map entries
 ~ATH(FMLINES) {
+    // pop next file map entry
     BIFURCATE FMLINES[FMLINE, FMLINES];
+    // skip empty entries
     LENGTH [FMLINE, NULL] FMLL;
     BRANCH(FMLL) {
+        // parse filename\tcid\tidx entry
         SPLIT [FMLINE, TAB] FMPARTS;
         BIFURCATE FMPARTS[FNAME, FMR1];
         BIFURCATE FMR1[FCID, FMR2];
         BIFURCATE FMR2[FIDX, FMR3];
 
+        // read old blob content from chamber storage
         TEXT ".ant/chambers/" FCID "/" FIDX AS BPATH;
         READ BPATH AS OLD;
 
+        // check if file exists in working tree
         EXISTS FNAME AS FEX;
         CLONE FEX AS FEXC;
         BRANCH(FEXC) {
+            // file exists — compare content
             READ FNAME AS NEW;
             STREQ [OLD, NEW] SAME;
             CLONE SAME AS SC;
             BRANCH(!SC) {
+                // content differs — emit line-by-line lockstep diff
+                // print diff header
                 PRINT --- a/$FNAME;
                 PRINT +++ b/$FNAME;
 
+                // split both versions into line lists
                 SPLIT [OLD, NL] OLINES;
                 SPLIT [NEW, NL] NLINES;
 
+                // process old lines in lockstep with new lines
                 ~ATH(OLINES) {
                     BIFURCATE OLINES[OL, OLINES];
+                    // skip empty lines (from trailing newlines)
                     LENGTH [OL, NULL] OLL;
                     BRANCH(OLL) {
+                        // if new version still has lines, compare
                         CLONE NLINES AS NC;
                         BRANCH(NC) {
                             BIFURCATE NLINES[NLN, NLINES];
                             STREQ [OL, NLN] LM;
                             CLONE LM AS LMC;
                             BRANCH(!LMC) {
+                                // lines differ — show both
                                 PRINT - $OL;
                                 PRINT + $NLN;
                             }
                         }
                         ELSE {
+                            // new version ran out of lines — this line was deleted
                             PRINT - $OL;
                         }
                     }
                 }
 
+                // print remaining new lines (if any) — these were added
                 ~ATH(NLINES) {
                     BIFURCATE NLINES[NLN, NLINES];
                     LENGTH [NLN, NULL] NLL;
@@ -137,6 +185,7 @@ SPLIT [FILE_MAP, NL] FMLINES;
             }
         }
         ELSE {
+            // file doesn't exist in working tree — was deleted
             PRINT --- a/$FNAME;
             PRINT (deleted);
         }

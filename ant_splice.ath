@@ -1,6 +1,27 @@
-// ant splice <branch> — merge another tunnel into current
-// file-level three-way merge with conflict markers
-// walks parent chains for cumulative file snapshots
+// ant splice <branch> — three-way merge of another tunnel into the current one
+//
+// algorithm:
+//   read OURS (current HEAD) and THEIRS (source branch) tip chamber ids
+//   find common ancestor by walking both parent chains in lockstep:
+//     advance whichever has the higher id until they meet
+//   allocate a new merge chamber with OURS tip as parent
+//   build cumulative file maps for both OURS and THEIRS
+//   merge OURS files:
+//     for each file in OURS map, read blob from its recorded cid/idx
+//     look up same filename in THEIRS via ANT_FIND (walks their chain)
+//     if THEIRS has it and content differs:
+//       look up in BASE (common ancestor) via ANT_FIND
+//       if ours==base: take theirs (only they changed)
+//       if theirs==base: keep ours (only we changed)
+//       if both differ from base or no base: emit conflict markers
+//     write merged blob to new chamber
+//   add THEIRS-only files:
+//     for each file in THEIRS map not in OURS SEEN string, copy blob
+//   write manifest, update OURS ref to new chamber, clear forage
+//   restore working tree from merged blobs
+//
+// O_SEEN pipe-string from OURS walk is reused to filter THEIRS-only files via CONTAINS
+// WIDX is the sequential blob counter for the merge chamber
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <split> AS SPLIT;
@@ -14,21 +35,22 @@ IMPORTF <add> AS ADD;
 IMPORTF <to_string> AS TO_STRING;
 IMPORTF "ant_find.ath" AS ANT_FIND;
 
+// extract source branch name from ARGS
 BIFURCATE ARGS[T_BRANCH, JUNK];
 
-// read our tip
+// read OURS (current HEAD) tip chamber id
 READ ".ant/HEAD" AS O_BRANCH;
 TRIM [O_BRANCH, NULL] O_BRANCH;
 TEXT ".ant/refs/" O_BRANCH AS O_REF;
 READ O_REF AS O_CID;
 TRIM [O_CID, NULL] O_CID;
 
-// read their tip
+// read THEIRS (source branch) tip chamber id
 TEXT ".ant/refs/" T_BRANCH AS T_REF;
 READ T_REF AS T_CID;
 TRIM [T_CID, NULL] T_CID;
 
-// already up to date?
+// if both tips point to same chamber, nothing to merge
 STREQ [O_CID, T_CID] SAME;
 CLONE SAME AS SC;
 BRANCH(SC) {
@@ -36,13 +58,15 @@ BRANCH(SC) {
     THIS.DIE();
 }
 
-// --- find common ancestor ---
-TEXT "" O_CID AS OW;
-TEXT "" T_CID AS TW;
-PARSE [OW, NULL] ON;
-PARSE [TW, NULL] TN;
+// find common ancestor by walking both parent chains in lockstep
+// advance whichever chain has the higher chamber id until they meet
+TEXT "" O_CID AS OW;  // ours walk cursor
+TEXT "" T_CID AS TW;  // theirs walk cursor
+PARSE [OW, NULL] ON;  // ours chamber id as number
+PARSE [TW, NULL] TN;  // theirs chamber id as number
 
 IMPORT ALIVE WALKING;
+// check if already at common ancestor
 STREQ [OW, TW] WS;
 CLONE WS AS WSC;
 BRANCH(WSC) {
@@ -50,9 +74,11 @@ BRANCH(WSC) {
 }
 
 ~ATH(WALKING) {
+    // advance the higher-id chain
     GT [ON, TN] O_HI;
     CLONE O_HI AS OHC;
     BRANCH(OHC) {
+        // ours is higher — step ours back to parent
         TEXT ".ant/chambers/" OW "/parent" AS PP;
         READ PP AS P;
         TRIM [P, NULL] P;
@@ -60,6 +86,7 @@ BRANCH(WSC) {
         PARSE [OW, NULL] ON;
     }
     ELSE {
+        // theirs is higher — step theirs back to parent
         TEXT ".ant/chambers/" TW "/parent" AS PP;
         READ PP AS P;
         TRIM [P, NULL] P;
@@ -67,6 +94,7 @@ BRANCH(WSC) {
         PARSE [TW, NULL] TN;
     }
 
+    // check if they now match
     STREQ [OW, TW] NS;
     CLONE NS AS NSC;
     BRANCH(NSC) {
@@ -74,9 +102,11 @@ BRANCH(WSC) {
     }
 }
 
+// both walk cursors now at common ancestor
 TEXT "" OW AS BASE_CID;
 
-// --- allocate merge chamber ---
+// allocate new merge chamber
+// read and increment next chamber id
 READ ".ant/next_id" AS ID_STR;
 TRIM [ID_STR, NULL] ID_STR;
 PARSE [ID_STR, NULL] ID_NUM;
@@ -84,41 +114,48 @@ ADD [ID_NUM, 1] NEXT_NUM;
 TO_STRING [NEXT_NUM, NULL] NEXT_STR;
 WRITE NEXT_STR TO ".ant/next_id" AS V1;
 
+// create chamber directory and metadata
 TEXT ".ant/chambers/" ID_STR AS CDIR;
 MKDIR CDIR;
+// parent is OURS tip (this is a merge commit)
 TEXT CDIR "/parent" AS PPATH;
 WRITE O_CID TO PPATH AS V2;
+// record merge message
 TEXT "splice tunnel '" T_BRANCH "'" AS CMSG;
 TEXT CDIR "/message" AS MPATH;
 WRITE CMSG TO MPATH AS V3;
 
+// shared constants for map-building
 TEXT "|" AS PIPE;
 TEXT "\t" AS TAB;
 TEXT "\n" AS NL;
 TEXT "0" AS ZERO_STR;
 
-// --- build cumulative file map for OURS ---
+// build cumulative file map for OURS (same algorithm as ant_diff/ant_status)
 TEXT "" AS O_FILE_MAP;
-TEXT "|" AS O_SEEN;
+TEXT "|" AS O_SEEN;  // dedup tracker, also used later to filter THEIRS-only files
 TEXT "" O_CID AS O_WALK;
 
 PARSE [O_WALK, NULL] O_WN;
 GT [O_WN, 0] O_WALKING;
 ~ATH(O_WALKING) {
+    // read current chamber's manifest
     TEXT ".ant/chambers/" O_WALK "/files" AS O_WMPATH;
     READ O_WMPATH AS O_WMAN;
     TRIM [O_WMAN, NULL] O_WMAN;
 
     SPLIT [O_WMAN, NL] O_WFILES;
-    PARSE [ZERO_STR, NULL] O_WIDX;
+    PARSE [ZERO_STR, NULL] O_WIDX; // reset counter per chamber
     ~ATH(O_WFILES) {
         BIFURCATE O_WFILES[O_WFNAME, O_WFILES];
         CLONE O_WFNAME AS OWFC;
         BRANCH(OWFC) {
+            // check if filename already seen (first occurrence wins)
             TEXT PIPE O_WFNAME PIPE AS O_WNEEDLE;
             CONTAINS [O_SEEN, O_WNEEDLE] O_WSEEN;
             CLONE O_WSEEN AS OWSC;
             BRANCH(!OWSC) {
+                // new filename — record in map and dedup tracker
                 CONCAT [O_SEEN, O_WFNAME] O_SEEN;
                 CONCAT [O_SEEN, PIPE] O_SEEN;
 
@@ -134,6 +171,7 @@ GT [O_WN, 0] O_WALKING;
         }
     }
 
+    // advance to parent chamber
     TEXT ".ant/chambers/" O_WALK "/parent" AS O_WPPATH;
     READ O_WPPATH AS O_WPAR;
     TRIM [O_WPAR, NULL] O_WPAR;
@@ -142,9 +180,9 @@ GT [O_WN, 0] O_WALKING;
     GT [O_WN, 0] O_WALKING;
 }
 
-// --- build cumulative file map for THEIRS ---
+// build cumulative file map for THEIRS (same algorithm)
 TEXT "" AS T_FILE_MAP;
-TEXT "|" AS T_SEEN;
+TEXT "|" AS T_SEEN;  // dedup tracker for THEIRS
 TEXT "" T_CID AS T_WALK;
 
 PARSE [T_WALK, NULL] T_WN;
@@ -187,57 +225,61 @@ GT [T_WN, 0] T_WALKING;
     GT [T_WN, 0] T_WALKING;
 }
 
-// --- merge OURS files ---
+// merge OURS files with three-way logic
 TRIM [O_FILE_MAP, NULL] O_FILE_MAP;
 SPLIT [O_FILE_MAP, NL] O_FMLINES;
-IMPORT NUMBER 0 AS WIDX;
-TEXT "" AS MANIFEST;
-IMPORT ALIVE CONFLICTS;
+IMPORT NUMBER 0 AS WIDX;  // blob counter for merge chamber
+TEXT "" AS MANIFEST;      // accumulates merged manifest (filenames)
+IMPORT ALIVE CONFLICTS;   // tracks if any conflicts were found
 CONFLICTS.DIE();
 
 ~ATH(O_FMLINES) {
     BIFURCATE O_FMLINES[O_FMLINE, O_FMLINES];
     CLONE O_FMLINE AS OFLC;
     BRANCH(OFLC) {
+        // parse OURS file map entry
         SPLIT [O_FMLINE, TAB] O_FMPARTS;
         BIFURCATE O_FMPARTS[FNAME, O_FMR1];
         BIFURCATE O_FMR1[O_FCID, O_FMR2];
         BIFURCATE O_FMR2[O_FIDX, O_FMR3];
 
-        // read our blob
+        // read OURS blob content
         TEXT ".ant/chambers/" O_FCID "/" O_FIDX AS OBP;
         READ OBP AS O_CON;
 
-        // default merged = ours
+        // default merge result is OURS content
         TEXT "" O_CON AS MERGED;
 
-        // look up in theirs
+        // look up same filename in THEIRS (ANT_FIND walks their parent chain)
         ANT_FIND [FNAME, T_CID] T_CON;
 
         CLONE T_CON AS TCC;
         BRANCH(TCC) {
-            // theirs has this file — compare
+            // THEIRS has this file — perform three-way merge
+            // compare OURS vs THEIRS
             STREQ [O_CON, T_CON] OT_EQ;
             CLONE OT_EQ AS OTE;
             BRANCH(!OTE) {
-                // different — check base
+                // content differs — three-way merge with BASE
+                // look up file in BASE (common ancestor)
                 ANT_FIND [FNAME, BASE_CID] B_CON;
                 CLONE B_CON AS BCC;
                 BRANCH(BCC) {
+                    // BASE has this file — check who changed it
                     STREQ [B_CON, O_CON] BO_EQ;
                     CLONE BO_EQ AS BOE;
                     BRANCH(BOE) {
-                        // ours == base, theirs changed → take theirs
+                        // OURS == BASE, THEIRS changed — take THEIRS
                         TEXT "" T_CON AS MERGED;
                     }
                     ELSE {
                         STREQ [B_CON, T_CON] BT_EQ;
                         CLONE BT_EQ AS BTE;
                         BRANCH(BTE) {
-                            // theirs == base, ours changed → keep ours
+                            // THEIRS == BASE, OURS changed — keep OURS (already in MERGED)
                         }
                         ELSE {
-                            // both changed → conflict
+                            // both changed from BASE — emit conflict markers
                             TEXT "<<<<<<< " O_BRANCH AS CM;
                             CONCAT [CM, NL] CM;
                             CONCAT [CM, O_CON] CM;
@@ -249,6 +291,7 @@ CONFLICTS.DIE();
                             CONCAT [CM, MK] CM;
                             CONCAT [CM, NL] CM;
                             TEXT "" CM AS MERGED;
+                            // mark that conflicts were found
                             IMPORT ALIVE CMARK;
                             BIFURCATE [CMARK, NULL] CONFLICTS;
                             PRINT CONFLICT: $FNAME;
@@ -256,7 +299,7 @@ CONFLICTS.DIE();
                     }
                 }
                 ELSE {
-                    // no base → conflict
+                    // no BASE version — file added in both branches with different content — conflict
                     TEXT "<<<<<<< " O_BRANCH AS CM;
                     CONCAT [CM, NL] CM;
                     CONCAT [CM, O_CON] CM;
@@ -275,21 +318,23 @@ CONFLICTS.DIE();
             }
         }
 
-        // write merged blob
+        // write merged blob to new chamber
         TO_STRING [WIDX, NULL] WS;
         TEXT CDIR "/" WS AS WBP;
         WRITE MERGED TO WBP AS V4;
 
+        // add filename to manifest (with newline separator if not first)
         CLONE MANIFEST AS MMC;
         BRANCH(MMC) {
             CONCAT [MANIFEST, NL] MANIFEST;
         }
         CONCAT [MANIFEST, FNAME] MANIFEST;
+        // increment blob counter
         ADD [WIDX, 1] WIDX;
     }
 }
 
-// --- add THEIRS-only files ---
+// add THEIRS-only files (files in THEIRS but not in OURS)
 TRIM [T_FILE_MAP, NULL] T_FILE_MAP;
 SPLIT [T_FILE_MAP, NL] T_FMLINES;
 
@@ -297,24 +342,27 @@ SPLIT [T_FILE_MAP, NL] T_FMLINES;
     BIFURCATE T_FMLINES[T_FMLINE, T_FMLINES];
     CLONE T_FMLINE AS TFLC;
     BRANCH(TFLC) {
+        // parse THEIRS file map entry
         SPLIT [T_FMLINE, TAB] T_FMPARTS;
         BIFURCATE T_FMPARTS[TFNAME, T_FMR1];
         BIFURCATE T_FMR1[T_FCID, T_FMR2];
         BIFURCATE T_FMR2[T_FIDX, T_FMR3];
 
-        // check if already in ours
+        // check if already in OURS (using O_SEEN pipe-delimited string)
         TEXT PIPE TFNAME PIPE AS T_NEEDLE;
         CONTAINS [O_SEEN, T_NEEDLE] ALREADY;
         CLONE ALREADY AS ALC;
         BRANCH(!ALC) {
-            // not in ours → add from theirs
+            // not in OURS — copy from THEIRS
             TEXT ".ant/chambers/" T_FCID "/" T_FIDX AS TBP;
             READ TBP AS TCON;
 
+            // write to merge chamber
             TO_STRING [WIDX, NULL] WS;
             TEXT CDIR "/" WS AS WBP;
             WRITE TCON TO WBP AS V7;
 
+            // add to manifest
             CLONE MANIFEST AS MMC;
             BRANCH(MMC) {
                 CONCAT [MANIFEST, NL] MANIFEST;
@@ -325,22 +373,25 @@ SPLIT [T_FILE_MAP, NL] T_FMLINES;
     }
 }
 
-// --- finalize ---
+// finalize merge chamber
+// write manifest file
 TEXT CDIR "/files" AS FPATH;
 WRITE MANIFEST TO FPATH AS V8;
+// update OURS ref to point to merge chamber
 WRITE ID_STR TO O_REF AS V9;
 
-// clear forage
+// clear forage pile
 TEXT "" AS EMPTY;
 WRITE EMPTY TO ".ant/forage" AS V10;
 
-// restore working tree
+// restore working tree from merged blobs
 SPLIT [MANIFEST, NL] RFILES;
 IMPORT NUMBER 0 AS RIDX;
 ~ATH(RFILES) {
     BIFURCATE RFILES[RFNAME, RFILES];
     CLONE RFNAME AS RFC;
     BRANCH(RFC) {
+        // read blob from merge chamber and write to working tree
         TO_STRING [RIDX, NULL] RIDX_S;
         TEXT CDIR "/" RIDX_S AS RBP;
         READ RBP AS RCON;
@@ -349,6 +400,7 @@ IMPORT NUMBER 0 AS RIDX;
     }
 }
 
+// report outcome
 CLONE CONFLICTS AS CFC;
 BRANCH(CFC) {
     PRINT splice complete with conflicts — resolve and dig;

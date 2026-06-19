@@ -1,4 +1,15 @@
-// ant deliver <host> <port> <colony-id> <password> — push to colony
+// ant deliver <host> <port> <colony-id> <password> — pushes local colony state to a remote ~colony server
+//
+// protocol:
+//   connect, AUTH with colony-id + password
+//   send PUSH, then HEAD, NEXTID
+//   send REFS (count, then name+cid pairs)
+//   send CHAMBERS (count, then per-chamber: id+filecount, then per-file: name+linecount+lines)
+//   wait for OK, send BYE, close
+//
+// each section counts items first (LISTDIR+loop), sends count header, then sends items
+// file content is split by newline and sent line-by-line
+//
 // ARGS = [HOST, [PORT_S, [COLONY_ID, [PASS, _]]]]
 
 IMPORTF <trim> AS TRIM;
@@ -11,12 +22,14 @@ IMPORTF <sub> AS SUB;
 IMPORTF <to_string> AS TO_STRING;
 IMPORTF <streq> AS STREQ;
 
+// extract args from nested list
 BIFURCATE ARGS[INNER, JUNK];
 BIFURCATE INNER[HOST, INNER];
 BIFURCATE INNER[PORT_S, INNER];
 BIFURCATE INNER[COLONY_ID, INNER];
 BIFURCATE INNER[PASS, JUNK2];
 
+// connect to server
 PARSE [PORT_S, NULL] PORT;
 CONNECT HOST PORT AS CONN;
 CLONE CONN AS CC;
@@ -25,7 +38,7 @@ BRANCH(!CC) {
     THIS.DIE();
 }
 
-// AUTH
+// authenticate with colony-id and password
 TEXT "AUTH " COLONY_ID " " PASS AS AUTH_MSG;
 SEND AUTH_MSG TO CONN;
 RECV FROM CONN AS REPLY;
@@ -39,25 +52,27 @@ BRANCH(!ROKC) {
     THIS.DIE();
 }
 
+// shared constants for formatting
 TEXT " " AS SP;
 TEXT "\n" AS NL;
 
-// PUSH
+// initiate PUSH operation
 SEND "PUSH" TO CONN;
 
-// HEAD
+// send HEAD tunnel name
 READ ".ant/HEAD" AS HVAL;
 TRIM [HVAL, NULL] HVAL;
 TEXT "HEAD " HVAL AS HM;
 SEND HM TO CONN;
 
-// NEXTID
+// send next chamber id counter
 READ ".ant/next_id" AS NVAL;
 TRIM [NVAL, NULL] NVAL;
 TEXT "NEXTID " NVAL AS NM;
 SEND NM TO CONN;
 
-// REFS — count then send
+// send REFS section: count all refs, then send count, then send each ref
+// first pass: count refs
 LISTDIR ".ant/refs" AS RLIST;
 IMPORT NUMBER 0 AS RCNT;
 CLONE RLIST AS RLC;
@@ -68,9 +83,11 @@ CLONE RLIST AS RLC;
         ADD [RCNT, 1] RCNT;
     }
 }
+// send REFS count header
 TO_STRING [RCNT, NULL] RCNT_S;
 TEXT "REFS " RCNT_S AS RM;
 SEND RM TO CONN;
+// second pass: send each ref (name + chamber id)
 LISTDIR ".ant/refs" AS RLIST2;
 ~ATH(RLIST2) {
     BIFURCATE RLIST2[RNAME, RLIST2];
@@ -84,7 +101,8 @@ LISTDIR ".ant/refs" AS RLIST2;
     }
 }
 
-// CHAMBERS — count then send
+// send CHAMBERS section: count chambers, then for each chamber send (id + filecount), then files
+// first pass: count chambers
 LISTDIR ".ant/chambers" AS CHLIST;
 IMPORT NUMBER 0 AS CHCNT;
 CLONE CHLIST AS CHLC;
@@ -95,9 +113,11 @@ CLONE CHLIST AS CHLC;
         ADD [CHCNT, 1] CHCNT;
     }
 }
+// send CHAMBERS count header
 TO_STRING [CHCNT, NULL] CHCNT_S;
 TEXT "CHAMBERS " CHCNT_S AS CHM;
 SEND CHM TO CONN;
+// second pass: send each chamber
 LISTDIR ".ant/chambers" AS CHLIST2;
 ~ATH(CHLIST2) {
     BIFURCATE CHLIST2[CHID, CHLIST2];
@@ -105,9 +125,9 @@ LISTDIR ".ant/chambers" AS CHLIST2;
     BRANCH(CHIDC) {
         TEXT ".ant/chambers/" CHID AS SCHD;
         LISTDIR SCHD AS CFLIST;
-        // count files
+        // count files in this chamber
         IMPORT NUMBER 0 AS FCNT;
-        SUB [FCNT, FCNT] FCNT;
+        SUB [FCNT, FCNT] FCNT; // reset counter (SUB creates fresh binding because IMPORT is first-bind-only)
         CLONE CFLIST AS CFLC;
         ~ATH(CFLC) {
             BIFURCATE CFLC[CFN, CFLC];
@@ -116,11 +136,12 @@ LISTDIR ".ant/chambers" AS CHLIST2;
                 ADD [FCNT, 1] FCNT;
             }
         }
+        // send chamber header: id + filecount
         TO_STRING [FCNT, NULL] FCNT_S;
         TEXT CHID " " FCNT_S AS CHENTRY;
         SEND CHENTRY TO CONN;
 
-        // send files
+        // send each file in chamber
         LISTDIR SCHD AS CFLIST2;
         ~ATH(CFLIST2) {
             BIFURCATE CFLIST2[CFNAME, CFLIST2];
@@ -129,19 +150,20 @@ LISTDIR ".ant/chambers" AS CHLIST2;
                 TEXT SCHD "/" CFNAME AS CFFP;
                 READ CFFP AS CFDATA;
 
-                // count lines
+                // count lines in file
                 SPLIT [CFDATA, NL] LCLINES;
                 IMPORT NUMBER 0 AS LNCNT;
-                SUB [LNCNT, LNCNT] LNCNT;
+                SUB [LNCNT, LNCNT] LNCNT; // reset counter
                 ~ATH(LCLINES) {
                     BIFURCATE LCLINES[LCL, LCLINES];
                     ADD [LNCNT, 1] LNCNT;
                 }
+                // send file header: name + linecount
                 TO_STRING [LNCNT, NULL] LNCNT_S;
                 TEXT CFNAME " " LNCNT_S AS FENTRY;
                 SEND FENTRY TO CONN;
 
-                // send lines
+                // send file content line-by-line
                 SPLIT [CFDATA, NL] SLLINES;
                 ~ATH(SLLINES) {
                     BIFURCATE SLLINES[SLL, SLLINES];
@@ -152,10 +174,11 @@ LISTDIR ".ant/chambers" AS CHLIST2;
     }
 }
 
-// wait for OK
+// wait for server acknowledgment
 RECV FROM CONN AS PREPLY;
 TRIM [PREPLY, NULL] PREPLY;
 
+// close connection
 SEND "BYE" TO CONN;
 CLOSE CONN;
 PRINT delivered to $COLONY_ID at $HOST:$PORT_S;

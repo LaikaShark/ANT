@@ -42,7 +42,7 @@ TEXT "\t" AS TAB;
 TEXT "\n" AS NL;
 TEXT "0" AS ZERO_STR;
 
-// ── build cumulative file map for target chamber ──
+// build cumulative file map for target chamber
 
 PARSE [CID, NULL] CID_NUM;
 GT [CID_NUM, 0] HAS_CHAMBER;
@@ -92,7 +92,7 @@ BRANCH(HC) {
         GT [WN, 0] WALKING;
     }
 
-    // ── restore files from cumulative snapshot ──
+    // restore files from cumulative snapshot
     TRIM [FILE_MAP, NULL] FILE_MAP;
     SPLIT [FILE_MAP, NL] FMLINES;
     ~ATH(FMLINES) {

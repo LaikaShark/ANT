@@ -1,5 +1,16 @@
-// ant status — show colony state
-// walks parent chain for cumulative snapshot, compares against working tree
+// ant status — shows colony state: current tunnel, forage pile, modified/deleted files
+//
+// algorithm:
+//   read HEAD tunnel name and tip chamber id
+//   if no chambers exist, show forage pile or "nothing collected"
+//   build cumulative file map (same parent-chain walk as diff)
+//   show forage pile if non-empty
+//   for each file in cumulative map:
+//     compare blob content against working tree
+//     if different or deleted, print under "modified:" header
+//   if nothing modified and nothing foraged, print "working tree clean"
+//
+// HAS_MOD flag uses IMPORT ALIVE + BIFURCATE idiom to flip once on first modification
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <split> AS SPLIT;
@@ -12,17 +23,21 @@ IMPORTF <gt> AS GT;
 IMPORTF <add> AS ADD;
 IMPORTF <to_string> AS TO_STRING;
 
+// read HEAD tunnel ref to get current tip chamber id
 READ ".ant/HEAD" AS TNAME;
 TRIM [TNAME, NULL] TNAME;
 TEXT ".ant/refs/" TNAME AS REF_PATH;
 READ REF_PATH AS CID;
 TRIM [CID, NULL] CID;
 
+// show current tunnel name
 PRINT on tunnel: $TNAME;
 
+// read forage pile for later display
 READ ".ant/forage" AS PILE;
 TRIM [PILE, NULL] PILE;
 
+// if no chambers exist, show forage or "nothing collected"
 PARSE [CID, NULL] CID_NUM;
 GT [CID_NUM, 0] HAS_CHAMBER;
 CLONE HAS_CHAMBER AS HC;
@@ -47,32 +62,36 @@ BRANCH(!HC) {
     THIS.DIE();
 }
 
-// ── build cumulative file map by walking parent chain ──
+// build cumulative file map by walking parent chain from tip to root
+// same algorithm as ant_diff: record filename\tcid\tidx for first occurrence
 TEXT "|" AS PIPE;
 TEXT "\t" AS TAB;
 TEXT "\n" AS NL;
 TEXT "" AS FILE_MAP;
-TEXT "|" AS SEEN;
-TEXT "0" AS ZERO_STR;
+TEXT "|" AS SEEN;     // dedup tracker
+TEXT "0" AS ZERO_STR; // for PARSE reset
 TEXT "" CID AS WALK_CUR;
 
 PARSE [WALK_CUR, NULL] WN;
 GT [WN, 0] WALKING;
 ~ATH(WALKING) {
+    // read current chamber's manifest
     TEXT ".ant/chambers/" WALK_CUR "/files" AS WMPATH;
     READ WMPATH AS WMAN;
     TRIM [WMAN, NULL] WMAN;
 
     SPLIT [WMAN, NL] WFILES;
-    PARSE [ZERO_STR, NULL] WIDX;
+    PARSE [ZERO_STR, NULL] WIDX; // reset counter per chamber
     ~ATH(WFILES) {
         BIFURCATE WFILES[WFNAME, WFILES];
         LENGTH [WFNAME, NULL] WFLEN;
         BRANCH(WFLEN) {
+            // check if filename already seen
             TEXT PIPE WFNAME PIPE AS WNEEDLE;
             CONTAINS [SEEN, WNEEDLE] WSEEN;
             CLONE WSEEN AS WSC;
             BRANCH(!WSC) {
+                // new filename — record it
                 CONCAT [SEEN, WFNAME] SEEN;
                 CONCAT [SEEN, PIPE] SEEN;
 
@@ -88,6 +107,7 @@ GT [WN, 0] WALKING;
         }
     }
 
+    // advance to parent chamber
     TEXT ".ant/chambers/" WALK_CUR "/parent" AS WPPATH;
     READ WPPATH AS WPAR;
     TRIM [WPAR, NULL] WPAR;
@@ -96,7 +116,7 @@ GT [WN, 0] WALKING;
     GT [WN, 0] WALKING;
 }
 
-// ── show forage pile ──
+// show forage pile if non-empty
 CLONE PILE AS PC;
 BRANCH(PC) {
     PRINT ;
@@ -111,9 +131,10 @@ BRANCH(PC) {
     }
 }
 
-// ── compare tracked files against working tree ──
+// compare tracked files against working tree
 TRIM [FILE_MAP, NULL] FILE_MAP;
 SPLIT [FILE_MAP, NL] FMLINES;
+// HAS_MOD flag starts dead, flips alive on first modification
 IMPORT ALIVE HAS_MOD;
 HAS_MOD.DIE();
 
@@ -121,25 +142,31 @@ HAS_MOD.DIE();
     BIFURCATE FMLINES[FMLINE, FMLINES];
     LENGTH [FMLINE, NULL] FMLL;
     BRANCH(FMLL) {
+        // parse filename\tcid\tidx entry
         SPLIT [FMLINE, TAB] FMPARTS;
         BIFURCATE FMPARTS[FNAME, FMR1];
         BIFURCATE FMR1[FCID, FMR2];
         BIFURCATE FMR2[FIDX, FMR3];
 
+        // read blob content from chamber storage
         TEXT ".ant/chambers/" FCID "/" FIDX AS BPATH;
         READ BPATH AS OLD;
 
+        // check if file exists in working tree
         EXISTS FNAME AS FEX;
         CLONE FEX AS FEXC;
         BRANCH(FEXC) {
+            // file exists — compare content
             READ FNAME AS CUR;
             STREQ [OLD, CUR] SAME;
             CLONE SAME AS SC;
             BRANCH(!SC) {
+                // content differs — print "modified:" header if first
                 CLONE HAS_MOD AS HMC;
                 BRANCH(!HMC) {
                     PRINT ;
                     PRINT modified:;
+                    // flip flag so header prints only once
                     IMPORT ALIVE MMARK;
                     BIFURCATE [MMARK, NULL] HAS_MOD;
                 }
@@ -147,6 +174,7 @@ HAS_MOD.DIE();
             }
         }
         ELSE {
+            // file deleted from working tree — print header if first
             CLONE HAS_MOD AS HMC;
             BRANCH(!HMC) {
                 PRINT ;
@@ -159,6 +187,7 @@ HAS_MOD.DIE();
     }
 }
 
+// if nothing modified and nothing foraged, print "working tree clean"
 CLONE HAS_MOD AS HMC2;
 CLONE PILE AS PC2;
 BRANCH(!HMC2) {

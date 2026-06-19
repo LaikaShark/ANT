@@ -1,4 +1,47 @@
-// ant trail v3 — column-based graph with box-drawing connectors
+// ant trail — display colony history as a column-based graph
+//
+// output format:
+//   Φ id branch: message     — commit
+//   ├◄─┐  splice (a ← b)     — merge event
+//   ├►─┘  fission (a → b)    — fork event
+//   │ for active columns, spaces for inactive
+//
+// algorithm:
+//   1. walk main's parent chain to collect MAIN_IDS and MAIN_LIST
+//   2. for each non-HEAD branch, walk its chain to find the fork
+//      point (first ancestor on main). record name, tip, fork in
+//      BRANCHES. stale branches (tip == fork, already on main) are
+//      excluded from BRANCHES
+//   3. scan main chambers for splice messages ("splice tunnel 'X'").
+//      match each against BRANCHES to build SPLICES (cid → branch)
+//   4. build LAYOUT: fixed column ordering for the entire display.
+//      walk main chain; at each splice add the spliced branch to
+//      LAYOUT, at each fork point add unspliced branches. this
+//      determines MAX_COLS and the graph width for label alignment
+//   5. render top-to-bottom (newest first). walk main's chain:
+//      - at splice chambers: activate the branch column (add to
+//        ALIVE), render ├◄─┐ connector, then walk the branch's
+//        exclusive commits (tip to fork) showing Φ in its column.
+//        mark branch in SHOWN so fission won't re-render commits
+//      - for each main chamber: render Φ in column 0, │ for alive
+//        columns, spaces for dead/removed columns
+//      - at fork points: for unspliced branches not in SHOWN,
+//        activate and render their exclusive commits first. then
+//        render ├►─┘ connector. deactivate column (remove from
+//        ALIVE). stale branches are silently skipped
+//
+// column rendering per cell (2 chars each):
+//   commit line:  Φ  in commit column, │  for alive, spaces for dead
+//   splice line:  ├◄ at target (col 0), ┐  at source, ┼─ for alive
+//                 between, ── for dead between, │  past source
+//   fission line: ├► at source (col 0), ┘  at target (if alive),
+//                 ┼─ for alive between, ── for dead between
+//
+// key idiom: PARSE [ZERO_STR, NULL] X resets counter X per loop
+// iteration. IMPORT NUMBER is first-bind-only and won't re-fire.
+// DIE inside BRANCH doesn't skip the rest of the ~ATH body —
+// CLONE guards (CLONE X AS XC; BRANCH(XC) { ... }) are used after
+// DIE calls to skip subsequent code when the sentinel is dead.
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <streq> AS STREQ;
@@ -35,8 +78,7 @@ TEXT "┼─" AS C_CROSS;
 TEXT "┘ " AS C_FORK_END;
 TEXT "┐ " AS C_SPLICE_END;
 
-// ── phase 1: read HEAD and walk main chain ──
-
+// read HEAD reference and walk main's parent chain to collect chamber IDs
 READ ".ant/HEAD" AS HEAD_NAME;
 TRIM [HEAD_NAME, NULL] HEAD_NAME;
 TEXT ".ant/refs/" HEAD_NAME AS HEAD_REF;
@@ -44,12 +86,15 @@ READ HEAD_REF AS HEAD_TIP;
 TRIM [HEAD_TIP, NULL] HEAD_TIP;
 PARSE [HEAD_TIP, NULL] TIP_NUM;
 GT [TIP_NUM, 0] HAS_CHAMBERS;
+// exit early if colony is empty
 CLONE HAS_CHAMBERS AS HCC;
 BRANCH(!HCC) {
     PRINT no chambers yet;
     THIS.DIE();
 }
 
+// MAIN_IDS: |cid| lookup table for fast contains checks
+// MAIN_LIST: cid\n sorted newest-first for iteration
 TEXT "|" AS MAIN_IDS;
 TEXT "" AS MAIN_LIST;
 TEXT "" HEAD_TIP AS MCUR;
@@ -61,6 +106,7 @@ GT [MCN, 0] MWK;
     CONCAT [MAIN_LIST, MCUR] MAIN_LIST;
     CONCAT [MAIN_LIST, NL] MAIN_LIST;
 
+    // follow parent link
     TEXT ".ant/chambers/" MCUR "/parent" AS MPP;
     READ MPP AS MPAR;
     TRIM [MPAR, NULL] MPAR;
@@ -69,9 +115,9 @@ GT [MCN, 0] MWK;
     GT [MCN, 0] MWK;
 }
 
-// ── phase 2: collect branch data ──
-// BRANCHES: "name\ttip\tfork\n..."
-
+// collect branch metadata: name, tip, fork point (first ancestor on main)
+// BRANCHES format: name\ttip\tfork\n...
+// stale branches (tip == fork) excluded since commits already on main
 TEXT "" AS BRANCHES;
 
 LISTDIR ".ant/refs" AS BREFS;
@@ -79,6 +125,7 @@ LISTDIR ".ant/refs" AS BREFS;
     BIFURCATE BREFS[BNAME, BREFS];
     CLONE BNAME AS BNC;
     BRANCH(BNC) {
+        // skip HEAD branch (processed separately)
         STREQ [BNAME, HEAD_NAME] IS_HD;
         CLONE IS_HD AS IHC;
         BRANCH(!IHC) {
@@ -89,10 +136,12 @@ LISTDIR ".ant/refs" AS BREFS;
             GT [BTN, 0] BVAL;
             CLONE BVAL AS BVC;
             BRANCH(BVC) {
+                // walk branch's parent chain until we hit main
                 TEXT "" BTIP AS BCUR;
                 TEXT "" BTIP AS BFORK;
                 BIFURCATE [BCUR, NULL] BWK;
 
+                // check if tip is already on main (immediate fork point)
                 TEXT PIPE BCUR PIPE AS BNEEDLE;
                 CONTAINS [MAIN_IDS, BNEEDLE] TON;
                 CLONE TON AS TONC;
@@ -112,6 +161,7 @@ LISTDIR ".ant/refs" AS BREFS;
                     BRANCH(!BCNTC) { BWK.DIE(); }
                     CLONE BWK AS BWKC;
                     BRANCH(BWKC) {
+                        // check if parent is on main (found fork point)
                         TEXT PIPE BCUR PIPE AS BN2;
                         CONTAINS [MAIN_IDS, BN2] ON2;
                         CLONE ON2 AS ON2C;
@@ -122,6 +172,7 @@ LISTDIR ".ant/refs" AS BREFS;
                     }
                 }
 
+                // record branch metadata if not stale (tip != fork)
                 CONCAT [BRANCHES, BNAME] BRANCHES;
                 CONCAT [BRANCHES, TAB] BRANCHES;
                 CONCAT [BRANCHES, BTIP] BRANCHES;
@@ -133,9 +184,8 @@ LISTDIR ".ant/refs" AS BREFS;
     }
 }
 
-// ── phase 3: detect splice chambers on main ──
-// SPLICES: "main_cid\tbranch_name\n..."
-
+// scan main chambers for splice messages to map main_cid → branch_name
+// SPLICES format: main_cid\tbranch_name\n...
 TEXT "" AS SPLICES;
 TEXT "splice tunnel '" AS SPLICE_PREFIX;
 
@@ -149,9 +199,11 @@ SPLIT [MAIN_LIST, NL] SMIDS;
         READ SMP AS SMSG;
         TRIM [SMSG, NULL] SMSG;
 
+        // check if message starts with "splice tunnel '"
         STARTSWITH [SMSG, SPLICE_PREFIX] IS_SPLICE;
         CLONE IS_SPLICE AS ISC;
         BRANCH(ISC) {
+            // match branch name in message against BRANCHES list
             TRIM [BRANCHES, NULL] TBRANCHES;
             SPLIT [TBRANCHES, NL] SBLINES;
             ~ATH(SBLINES) {
@@ -163,6 +215,7 @@ SPLIT [MAIN_LIST, NL] SMIDS;
                     CONTAINS [SMSG, SBN] SBMATCH;
                     CLONE SBMATCH AS SBMC;
                     BRANCH(SBMC) {
+                        // record splice: main chamber ID → branch name
                         CONCAT [SPLICES, SMID] SPLICES;
                         CONCAT [SPLICES, TAB] SPLICES;
                         CONCAT [SPLICES, SBN] SPLICES;
@@ -174,10 +227,10 @@ SPLIT [MAIN_LIST, NL] SMIDS;
     }
 }
 
-// ── phase 3b: build LAYOUT and compute MAX_COLS ──
-// LAYOUT: "main\tbranch1\tbranch2\t..." — all columns in display order
-// walk main chain to discover order: splices first, then unspliced at fork
-
+// build LAYOUT: fixed column ordering for entire display
+// LAYOUT format: main\tbranch1\tbranch2\t...
+// order: main (col 0), then branches as they appear: spliced branches at
+// splice chambers, unspliced branches at fork points. MAX_COLS sets graph width
 TEXT HEAD_NAME TAB AS LAYOUT;
 IMPORT NUMBER 1 AS MAX_COLS;
 
@@ -186,7 +239,7 @@ SPLIT [MAIN_LIST, NL] LIDS;
     BIFURCATE LIDS[LID, LIDS];
     CLONE LID AS LIDC;
     BRANCH(LIDC) {
-        // check for splice at this chamber
+        // add spliced branches to LAYOUT at their splice chamber
         TRIM [SPLICES, NULL] TSPL;
         SPLIT [TSPL, NL] LSPL;
         ~ATH(LSPL) {
@@ -206,7 +259,7 @@ SPLIT [MAIN_LIST, NL] LIDS;
             }
         }
 
-        // check for unspliced non-stale forks at this chamber
+        // add unspliced branches to LAYOUT at their fork point
         TRIM [BRANCHES, NULL] TBRK;
         SPLIT [TBRK, NL] LBRK;
         ~ATH(LBRK) {
@@ -220,10 +273,11 @@ SPLIT [MAIN_LIST, NL] LIDS;
                 STREQ [LBF, LID] LB_HERE;
                 CLONE LB_HERE AS LBHC;
                 BRANCH(LBHC) {
+                    // skip stale branches (tip == fork, commits already on main)
                     STREQ [LBT, LBF] LB_STALE;
                     CLONE LB_STALE AS LBSTC;
                     BRANCH(!LBSTC) {
-                        // not stale, check not already spliced
+                        // skip if already added as spliced branch
                         TEXT TAB LBN TAB AS LBN_NDL;
                         CONTAINS [SPLICES, LBN] LB_SPLICED;
                         CLONE LB_SPLICED AS LBSPC;
@@ -239,17 +293,16 @@ SPLIT [MAIN_LIST, NL] LIDS;
     }
 }
 
-// compute GRAPH_WIDTH = MAX_COLS * 2
+// each column is 2 chars wide (Φ  or │  or spaces)
 ADD [MAX_COLS, MAX_COLS] GRAPH_WIDTH;
 
-// ── phase 4: render ──
-// ALIVE: "|branch1|branch2|" — columns currently showing │
-// iterate LAYOUT for fixed column positions
-
+// render top-to-bottom (newest first)
+// ALIVE: |branch1|branch2| tracks columns currently showing │ (active)
+// SHOWN: |branch1| tracks branches whose exclusive commits were already rendered
 TEXT "|" HEAD_NAME "|" AS ALIVE;
 TEXT "|" AS SHOWN;
 
-// opening bar: pad to GRAPH_WIDTH then empty label
+// render initial row: │ in active columns to start the graph
 SPLIT [LAYOUT, TAB] OLCOLS;
 ~ATH(OLCOLS) {
     BIFURCATE OLCOLS[OLC, OLCOLS];
@@ -270,7 +323,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
     CLONE RID AS RIDC;
     BRANCH(RIDC) {
 
-        // ── detect splice ──
+        // check if this chamber is a splice point
         TEXT "" AS SPLICE_BRANCH;
         TRIM [SPLICES, NULL] TSPLICES;
         SPLIT [TSPLICES, NL] SPLINES;
@@ -293,11 +346,11 @@ SPLIT [MAIN_LIST, NL] RIDS;
         GT [SBLEN, 0] HAS_SPLICE;
         CLONE HAS_SPLICE AS HSC;
         BRANCH(HSC) {
-            // activate branch column
+            // activate the spliced branch column (add to ALIVE)
             CONCAT [ALIVE, SPLICE_BRANCH] ALIVE;
             CONCAT [ALIVE, PIPE] ALIVE;
 
-            // find source column index
+            // find which column the branch occupies
             PARSE [ZERO_STR, NULL] TARGET_COL;
             PARSE [ZERO_STR, NULL] SCOL_I;
             SPLIT [LAYOUT, TAB] SPCOLS;
@@ -314,7 +367,8 @@ SPLIT [MAIN_LIST, NL] RIDS;
                 }
             }
 
-            // render splice line
+            // render splice connector: ├◄ at col 0, ┐ at branch column,
+            // ┼─ for alive columns between, ── for dead between, │ past branch
             PARSE [ZERO_STR, NULL] SLI;
             SPLIT [LAYOUT, TAB] SLCOLS;
             ~ATH(SLCOLS) {
@@ -324,18 +378,19 @@ SPLIT [MAIN_LIST, NL] RIDS;
                     EQ [SLI, 0] SL_IS_TGT;
                     CLONE SL_IS_TGT AS SLTC;
                     BRANCH(SLTC) {
-                        EMIT $C_SPLICE_TGT;
+                        EMIT $C_SPLICE_TGT;  // ├◄ at target (main, col 0)
                     }
                     ELSE {
                         EQ [SLI, TARGET_COL] SL_IS_SRC;
                         CLONE SL_IS_SRC AS SLSC;
                         BRANCH(SLSC) {
-                            EMIT $C_SPLICE_END;
+                            EMIT $C_SPLICE_END;  // ┐ at source (branch column)
                         }
                         ELSE {
                             GT [SLI, TARGET_COL] SL_PAST;
                             CLONE SL_PAST AS SLPC;
                             BRANCH(!SLPC) {
+                                // between target and source: ┼─ if alive, ── if dead
                                 TEXT PIPE SLCOL PIPE AS SL_NDL;
                                 CONTAINS [ALIVE, SL_NDL] SL_UP;
                                 CLONE SL_UP AS SLUC;
@@ -343,6 +398,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                                 ELSE { EMIT $C_HLINE; }
                             }
                             ELSE {
+                                // past source: │ if alive, spaces if dead
                                 TEXT PIPE SLCOL PIPE AS SL_NDL2;
                                 CONTAINS [ALIVE, SL_NDL2] SL_UP2;
                                 CLONE SL_UP2 AS SLUC2;
@@ -357,7 +413,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
             TEXT "splice (" HEAD_NAME " ← " SPLICE_BRANCH ")" AS SPLABEL;
             PRINT $SPLABEL;
 
-            // render branch exclusive commits
+            // walk branch's exclusive commits (tip to fork point)
             TRIM [BRANCHES, NULL] TBRANCHES2;
             SPLIT [TBRANCHES2, NL] BXLINES;
             TEXT "" AS BX_TIP;
@@ -382,10 +438,12 @@ SPLIT [MAIN_LIST, NL] RIDS;
             TEXT "" BX_TIP AS BXCUR;
             BIFURCATE [BXCUR, NULL] BXWK;
 
+            // stop if already at fork point
             STREQ [BXCUR, BX_FORK] BX_AT_FK;
             CLONE BX_AT_FK AS BXAFC;
             BRANCH(BXAFC) { BXWK.DIE(); }
 
+            // stop if current commit is on main chain
             TEXT PIPE BXCUR PIPE AS BXN_CHK;
             CONTAINS [MAIN_IDS, BXN_CHK] BX_ON_M;
             CLONE BX_ON_M AS BXOMC;
@@ -402,6 +460,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                     READ BXMP AS BXMSG;
                     TRIM [BXMSG, NULL] BXMSG;
 
+                    // render commit line: Φ in branch column, │ or spaces elsewhere
                     PARSE [ZERO_STR, NULL] BXI;
                     SPLIT [LAYOUT, TAB] BXCOLS;
                     ~ATH(BXCOLS) {
@@ -424,11 +483,13 @@ SPLIT [MAIN_LIST, NL] RIDS;
                     TEXT BXCUR " " SPLICE_BRANCH ": " BXMSG AS BXLABEL;
                     PRINT $BXLABEL;
 
+                    // follow parent link
                     TEXT ".ant/chambers/" BXCUR "/parent" AS BXPP;
                     READ BXPP AS BXPAR;
                     TRIM [BXPAR, NULL] BXPAR;
                     TEXT "" BXPAR AS BXCUR;
 
+                    // stop if parent is on main chain
                     TEXT PIPE BXCUR PIPE AS BXNCK;
                     CONTAINS [MAIN_IDS, BXNCK] BXONM2;
                     CLONE BXONM2 AS BXOM2C;
@@ -436,16 +497,17 @@ SPLIT [MAIN_LIST, NL] RIDS;
                 }
             }
 
-            // mark commits shown (column stays alive until fission)
+            // mark branch as shown so fission won't re-render these commits
             CONCAT [SHOWN, SPLICE_BRANCH] SHOWN;
             CONCAT [SHOWN, PIPE] SHOWN;
         }
 
-        // ── render main commit line ──
+        // render the main chamber commit
         TEXT ".ant/chambers/" RID "/message" AS RMP;
         READ RMP AS RMSG;
         TRIM [RMSG, NULL] RMSG;
 
+        // append chamber name if present
         TEXT "" AS RNAME;
         TEXT ".ant/chambers/" RID "/name" AS RNP;
         EXISTS RNP AS HAS_NM;
@@ -456,6 +518,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
             TEXT " (" RNVAL ")" AS RNAME;
         }
 
+        // render commit line: Φ in col 0 (main), │ for alive, spaces for dead
         PARSE [ZERO_STR, NULL] RI;
         SPLIT [LAYOUT, TAB] RCOLS;
         ~ATH(RCOLS) {
@@ -478,7 +541,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
         TEXT RID " " HEAD_NAME RNAME ": " RMSG AS RLABEL;
         PRINT $RLABEL;
 
-        // ── check forks ──
+        // check if any branches fork at this chamber
         TRIM [BRANCHES, NULL] TBRANCHES3;
         SPLIT [TBRANCHES3, NL] FKLINES;
         ~ATH(FKLINES) {
@@ -492,16 +555,17 @@ SPLIT [MAIN_LIST, NL] RIDS;
                 STREQ [FKF, RID] FK_HERE;
                 CLONE FK_HERE AS FKHC;
                 BRANCH(FKHC) {
+                    // skip stale branches (tip == fork)
                     STREQ [FKT, FKF] FK_STALE;
                     CLONE FK_STALE AS FKSC;
                     BRANCH(!FKSC) {
 
-                    // unspliced? show commits first (skip if already shown at splice)
+                    // if unspliced and not shown, render exclusive commits first
                     TEXT PIPE FKN PIPE AS FK_SH_NDL;
                     CONTAINS [SHOWN, FK_SH_NDL] FK_WAS_SHOWN;
                     CLONE FK_WAS_SHOWN AS FKWSC;
                     BRANCH(!FKWSC) {
-                        // activate for unspliced branch
+                        // activate unspliced branch column
                         CONCAT [ALIVE, FKN] ALIVE;
                         CONCAT [ALIVE, PIPE] ALIVE;
 
@@ -528,6 +592,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
 
                         TEXT "" UX_TIP AS UXCUR;
                         BIFURCATE [UXCUR, NULL] UXWK;
+                        // stop if tip is on main or already at fork
                         TEXT PIPE UXCUR PIPE AS UXN1;
                         CONTAINS [MAIN_IDS, UXN1] UX1;
                         CLONE UX1 AS UX1C;
@@ -546,6 +611,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                                 READ UXMP AS UXMSG;
                                 TRIM [UXMSG, NULL] UXMSG;
 
+                                // render commit line for unspliced branch
                                 PARSE [ZERO_STR, NULL] UXI;
                                 SPLIT [LAYOUT, TAB] UXCOLS;
                                 ~ATH(UXCOLS) {
@@ -568,10 +634,12 @@ SPLIT [MAIN_LIST, NL] RIDS;
                                 TEXT UXCUR " " FKN ": " UXMSG AS UXLBL;
                                 PRINT $UXLBL;
 
+                                // follow parent link
                                 TEXT ".ant/chambers/" UXCUR "/parent" AS UXPP;
                                 READ UXPP AS UXPAR;
                                 TRIM [UXPAR, NULL] UXPAR;
                                 TEXT "" UXPAR AS UXCUR;
+                                // stop if parent is on main
                                 TEXT PIPE UXCUR PIPE AS UXNCK;
                                 CONTAINS [MAIN_IDS, UXNCK] UXONM;
                                 CLONE UXONM AS UXONMC;
@@ -580,7 +648,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                         }
                     }
 
-                    // find column position
+                    // find which column the forked branch occupies
                     PARSE [ZERO_STR, NULL] FKI;
                     PARSE [ZERO_STR, NULL] FK_COL;
                     SPLIT [LAYOUT, TAB] FKCOLS;
@@ -595,11 +663,12 @@ SPLIT [MAIN_LIST, NL] RIDS;
                         }
                     }
 
-                    // check if branch is alive (has │ to connect)
+                    // check if branch column is alive (showing │)
                     TEXT PIPE FKN PIPE AS FK_A_NDL;
                     CONTAINS [ALIVE, FK_A_NDL] FK_IS_ALIVE;
 
-                    // render fission line
+                    // render fission connector: ├► at col 0, ┘ at branch (if alive),
+                    // ┼─ for alive between, ── for dead between, │ past branch
                     PARSE [ZERO_STR, NULL] FLI;
                     SPLIT [LAYOUT, TAB] FLCOLS;
                     ~ATH(FLCOLS) {
@@ -608,7 +677,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                         BRANCH(FLCC) {
                             EQ [FLI, 0] FL_IS_SRC;
                             CLONE FL_IS_SRC AS FLSC;
-                            BRANCH(FLSC) { EMIT $C_FORK_SRC; }
+                            BRANCH(FLSC) { EMIT $C_FORK_SRC; }  // ├► at source (main, col 0)
                             ELSE {
                                 GT [FLI, FK_COL] FL_PAST;
                                 CLONE FL_PAST AS FLPC;
@@ -616,11 +685,13 @@ SPLIT [MAIN_LIST, NL] RIDS;
                                     EQ [FLI, FK_COL] FL_IS_TGT;
                                     CLONE FL_IS_TGT AS FLTC;
                                     BRANCH(FLTC) {
+                                        // ┘ at target only if branch was alive
                                         CLONE FK_IS_ALIVE AS FKIAC;
                                         BRANCH(FKIAC) { EMIT $C_FORK_END; }
                                         ELSE { EMIT $C_SPC; }
                                     }
                                     ELSE {
+                                        // between source and target: ┼─ if alive, ── if dead
                                         TEXT PIPE FLCOL PIPE AS FL_NDL;
                                         CONTAINS [ALIVE, FL_NDL] FL_UP;
                                         CLONE FL_UP AS FLUC;
@@ -629,6 +700,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                                     }
                                 }
                                 ELSE {
+                                    // past target: │ if alive, spaces if dead
                                     TEXT PIPE FLCOL PIPE AS FL_NDL2;
                                     CONTAINS [ALIVE, FL_NDL2] FL_UP2;
                                     CLONE FL_UP2 AS FLUC2;
@@ -642,10 +714,11 @@ SPLIT [MAIN_LIST, NL] RIDS;
                     TEXT "fission (" HEAD_NAME " → " FKN ")" AS FKLABEL;
                     PRINT $FKLABEL;
 
-                    // deactivate
+                    // deactivate branch column (remove from ALIVE)
                     TEXT "" AS NEW_ALIVE2;
                     TEXT PIPE AS NA2_P;
                     CONCAT [NEW_ALIVE2, NA2_P] NEW_ALIVE2;
+                    // rebuild ALIVE without the forked branch
                     SPLIT [ALIVE, PIPE] APARTS2;
                     ~ATH(APARTS2) {
                         BIFURCATE APARTS2[AP2, APARTS2];
@@ -661,7 +734,7 @@ SPLIT [MAIN_LIST, NL] RIDS;
                     }
                     TEXT "" NEW_ALIVE2 AS ALIVE;
 
-                    } // end !FK_STALE
+                    }
                 }
             }
         }

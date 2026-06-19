@@ -1,4 +1,16 @@
-// ant gather <host> <port> <colony-id> <password> — pull from colony
+// ant gather <host> <port> <colony-id> <password> — pulls remote colony state from a ~colony server and restores working tree
+//
+// protocol:
+//   connect, AUTH with colony-id + password
+//   send PULL
+//   receive HEAD, NEXTID, REFS (count+pairs), CHAMBERS (count+per-chamber data)
+//   for each chamber: create directory, receive files line-by-line, reassemble content
+//   restore working tree from HEAD tip's manifest
+//
+// nested receive loops reconstruct chamber files
+// line-by-line reassembly uses CONCAT with NL separator
+// SUB [X,X] resets counters (same reason as PARSE reset — IMPORT is first-bind-only)
+//
 // ARGS = [HOST, [PORT_S, [COLONY_ID, [PASS, _]]]]
 
 IMPORTF <trim> AS TRIM;
@@ -12,12 +24,14 @@ IMPORTF <to_string> AS TO_STRING;
 IMPORTF <streq> AS STREQ;
 IMPORTF <length> AS LENGTH;
 
+// extract args from nested list
 BIFURCATE ARGS[INNER, JUNK];
 BIFURCATE INNER[HOST, INNER];
 BIFURCATE INNER[PORT_S, INNER];
 BIFURCATE INNER[COLONY_ID, INNER];
 BIFURCATE INNER[PASS, JUNK2];
 
+// connect to server
 PARSE [PORT_S, NULL] PORT;
 CONNECT HOST PORT AS CONN;
 CLONE CONN AS CC;
@@ -26,7 +40,7 @@ BRANCH(!CC) {
     THIS.DIE();
 }
 
-// AUTH
+// authenticate with colony-id and password
 TEXT "AUTH " COLONY_ID " " PASS AS AUTH_MSG;
 SEND AUTH_MSG TO CONN;
 RECV FROM CONN AS REPLY;
@@ -40,10 +54,11 @@ BRANCH(!ROKC) {
     THIS.DIE();
 }
 
+// shared constants for parsing
 TEXT " " AS SP;
 TEXT "\n" AS NL;
 
-// scaffold local .ant/ if needed
+// scaffold local .ant/ directory structure if missing
 EXISTS ".ant" AS AE;
 CLONE AE AS AEC;
 BRANCH(!AEC) {
@@ -52,77 +67,84 @@ BRANCH(!AEC) {
     MKDIR ".ant/chambers";
 }
 
-// PULL
+// initiate PULL operation
 SEND "PULL" TO CONN;
 
-// HEAD
+// receive HEAD tunnel name
 RECV FROM CONN AS HL;
-SPLIT [HL, SP] HP;
+SPLIT [HL, SP] HP;  // parse "HEAD <name>"
 BIFURCATE HP[HCMD, HP];
 BIFURCATE HP[HVAL, HJNK];
 WRITE HVAL TO ".ant/HEAD" AS VH;
 
-// NEXTID
+// receive next chamber id counter
 RECV FROM CONN AS NL2;
-SPLIT [NL2, SP] NP;
+SPLIT [NL2, SP] NP;  // parse "NEXTID <num>"
 BIFURCATE NP[NCMD, NP];
 BIFURCATE NP[NVAL, NJNK];
 WRITE NVAL TO ".ant/next_id" AS VN;
 
-// REFS <count>
+// receive REFS section: count header, then name+cid pairs
 RECV FROM CONN AS RL;
-SPLIT [RL, SP] RP;
+SPLIT [RL, SP] RP;  // parse "REFS <count>"
 BIFURCATE RP[RCMD, RP];
 BIFURCATE RP[RC_S, RJNK];
-PARSE [RC_S, NULL] RC;
-IMPORT NUMBER 0 AS RI;
-GT [RC, RI] RMORE;
+PARSE [RC_S, NULL] RC;  // ref count
+IMPORT NUMBER 0 AS RI;  // counter
+GT [RC, RI] RMORE;      // loop while more refs to receive
 ~ATH(RMORE) {
+    // receive one ref line: name + chamber id
     RECV FROM CONN AS RLINE;
     SPLIT [RLINE, SP] RLP;
     BIFURCATE RLP[RNAME, RLP];
     BIFURCATE RLP[RCID, RJNK2];
+    // write ref to .ant/refs/<name>
     TEXT ".ant/refs/" RNAME AS RFP;
     WRITE RCID TO RFP AS VR;
+    // advance counter
     ADD [RI, 1] RI;
     GT [RC, RI] RMORE;
 }
 
-// CHAMBERS <count>
+// receive CHAMBERS section: count header, then per-chamber data
 RECV FROM CONN AS CHL;
-SPLIT [CHL, SP] CHP;
+SPLIT [CHL, SP] CHP;  // parse "CHAMBERS <count>"
 BIFURCATE CHP[CHCMD, CHP];
 BIFURCATE CHP[CHC_S, CHJNK];
-PARSE [CHC_S, NULL] CHC;
-IMPORT NUMBER 0 AS CHI;
-GT [CHC, CHI] CHMORE;
+PARSE [CHC_S, NULL] CHC;  // chamber count
+IMPORT NUMBER 0 AS CHI;   // counter
+GT [CHC, CHI] CHMORE;     // loop while more chambers to receive
 ~ATH(CHMORE) {
-    // <cid> <filecount>
+    // receive chamber header: id + filecount
     RECV FROM CONN AS CHLINE;
     SPLIT [CHLINE, SP] CHLP;
     BIFURCATE CHLP[CHID, CHLP];
     BIFURCATE CHLP[FC_S, CHJNK2];
+    // create chamber directory
     TEXT ".ant/chambers/" CHID AS CDIR;
     MKDIR CDIR;
 
-    PARSE [FC_S, NULL] FC;
-    IMPORT NUMBER 0 AS FI;
-    SUB [FI, FI] FI;
-    GT [FC, FI] FMORE;
+    // receive files in this chamber
+    PARSE [FC_S, NULL] FC;  // file count for this chamber
+    IMPORT NUMBER 0 AS FI;  // file counter
+    SUB [FI, FI] FI;        // reset counter (SUB creates fresh binding)
+    GT [FC, FI] FMORE;      // loop while more files in chamber
     ~ATH(FMORE) {
-        // <filename> <linecount>
+        // receive file header: name + linecount
         RECV FROM CONN AS FHDR;
         SPLIT [FHDR, SP] FHP;
         BIFURCATE FHP[FNAME, FHP];
         BIFURCATE FHP[LC_S, FJNK];
 
-        PARSE [LC_S, NULL] LC;
-        TEXT "" AS FDATA;
-        IMPORT NUMBER 0 AS LI;
-        SUB [LI, LI] LI;
-        GT [LC, LI] LMORE;
+        // receive file content line-by-line and reassemble
+        PARSE [LC_S, NULL] LC;  // line count for this file
+        TEXT "" AS FDATA;       // accumulates file content
+        IMPORT NUMBER 0 AS LI;  // line counter
+        SUB [LI, LI] LI;        // reset counter
+        GT [LC, LI] LMORE;      // loop while more lines in file
         ~ATH(LMORE) {
             RECV FROM CONN AS FLINE;
+            // add newline separator between lines (not before first line)
             CLONE FDATA AS FDC;
             BRANCH(FDC) {
                 CONCAT [FDATA, NL] FDATA;
@@ -132,50 +154,59 @@ GT [CHC, CHI] CHMORE;
             GT [LC, LI] LMORE;
         }
 
+        // write reassembled file to chamber
         TEXT CDIR "/" FNAME AS FFP;
         WRITE FDATA TO FFP AS VP;
         ADD [FI, 1] FI;
         GT [FC, FI] FMORE;
     }
 
+    // advance chamber counter
     ADD [CHI, 1] CHI;
     GT [CHC, CHI] CHMORE;
 }
 
-// wait for OK
+// wait for server acknowledgment
 RECV FROM CONN AS PREPLY;
 
-// restore working tree from HEAD tip
+// restore working tree from HEAD tip chamber
 TRIM [HVAL, NULL] HVAL;
 TEXT ".ant/refs/" HVAL AS HREF;
-READ HREF AS TIP;
+READ HREF AS TIP;  // read tip chamber id for HEAD tunnel
 TRIM [TIP, NULL] TIP;
 
+// if tip chamber exists, restore files from it
 PARSE [TIP, NULL] TIP_NUM;
 GT [TIP_NUM, 0] HAS_TIP;
 CLONE HAS_TIP AS HTC;
 BRANCH(HTC) {
+    // read tip chamber's manifest
     TEXT ".ant/chambers/" TIP "/files" AS MPATH;
     READ MPATH AS MANIFEST;
     TRIM [MANIFEST, NULL] MANIFEST;
 
+    // write each blob to working tree
     SPLIT [MANIFEST, NL] FNAMES;
     IMPORT NUMBER 0 AS IDX;
     ~ATH(FNAMES) {
         BIFURCATE FNAMES[WFNAME, FNAMES];
         CLONE WFNAME AS WFC;
         BRANCH(WFC) {
+            // read blob from chamber storage
             TO_STRING [IDX, NULL] IDX_S;
             TEXT ".ant/chambers/" TIP "/" IDX_S AS BPATH;
             READ BPATH AS BLOB;
+            // write to working tree
             WRITE BLOB TO WFNAME AS VW;
             ADD [IDX, 1] IDX;
         }
     }
 }
 
+// close connection
 SEND "BYE" TO CONN;
 CLOSE CONN;
+// clear forage pile
 TEXT "" AS EMPTY;
 WRITE EMPTY TO ".ant/forage" AS VF;
 PRINT gathered from $COLONY_ID at $HOST:$PORT_S;

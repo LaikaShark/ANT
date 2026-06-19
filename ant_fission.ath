@@ -1,8 +1,18 @@
-// ant fission [<name> [<chamber-id-or-name>]] — split the colony
-// no args: list all tunnels
-// name only: create tunnel at current HEAD chamber
-// name + id/name: create tunnel at given chamber, switch to it, restore working tree
-//   accepts a numeric chamber id or a chamber name set by "ant dig <msg> <name>"
+// ant fission [<name> [<chamber-id-or-name>]] — branch management: list, create, or create-and-switch
+//
+// modes:
+//   no args: list all tunnels, mark current HEAD with *
+//   name only: create branch ref at current HEAD tip (no switch)
+//   name + ref: create branch at given chamber (by numeric id or name),
+//     switch HEAD, clear forage, restore working tree from target
+//     if ref is not a numeric chamber id, search all chambers for matching name
+//
+// algorithm for restore:
+//   read target chamber manifest, write each blob to working tree
+//   scan old chamber manifest for files not in target, attempt cleanup
+//   (cleanup is best-effort — ~ATH has no file deletion primitive)
+//
+// the chamber-name search iterates all chamber directories looking for a /name file matching the target string
 
 IMPORTF <trim> AS TRIM;
 IMPORTF <streq> AS STREQ;
@@ -13,9 +23,10 @@ IMPORTF <gt> AS GT;
 IMPORTF <add> AS ADD;
 IMPORTF <to_string> AS TO_STRING;
 
+// extract branch name from ARGS
 BIFURCATE ARGS[NAME, REST];
 
-// if no name given, list branches
+// mode 1: no name given — list all branches with * marking current HEAD
 CLONE NAME AS NCHECK;
 BRANCH(!NCHECK) {
     LISTDIR ".ant/refs" AS BRANCHES;
@@ -26,6 +37,7 @@ BRANCH(!NCHECK) {
         BIFURCATE BRANCHES[BNAME, BRANCHES];
         LENGTH [BNAME, NULL] BLEN;
         BRANCH(BLEN) {
+            // check if this branch is current HEAD
             STREQ [BNAME, CURRENT] IS_CUR;
             CLONE IS_CUR AS IC;
             BRANCH(IC) {
@@ -39,23 +51,23 @@ BRANCH(!NCHECK) {
     THIS.DIE();
 }
 
-// check for optional chamber id or name
+// mode 3: name + chamber id or chamber name — create branch and switch to it
 CLONE REST AS RCHECK;
 BRANCH(RCHECK) {
     BIFURCATE REST[TARGET, JUNK2];
 
-    // try as numeric chamber id first
+    // try parsing TARGET as numeric chamber id first
     TEXT ".ant/chambers/" TARGET AS CDIR;
     EXISTS CDIR AS CE;
     CLONE CE AS CEC;
     BRANCH(CEC) {
-        // numeric id matched — use it directly
+        // TARGET is a numeric chamber id — use it directly
         TEXT "" TARGET AS TARGET_CID;
     }
     ELSE {
-        // not a numeric id — search chamber names
+        // TARGET is not numeric — search for chamber with matching /name file
         LISTDIR ".ant/chambers" AS CIDS;
-        IMPORT ALIVE FOUND;
+        IMPORT ALIVE FOUND;  // flag to track if we found a match
         FOUND.DIE();
         TEXT "" AS TARGET_CID;
 
@@ -63,15 +75,18 @@ BRANCH(RCHECK) {
             BIFURCATE CIDS[CID, CIDS];
             CLONE CID AS CIDC;
             BRANCH(CIDC) {
+                // check if this chamber has a /name file
                 TEXT ".ant/chambers/" CID "/name" AS NPATH;
                 EXISTS NPATH AS NE;
                 CLONE NE AS NEC;
                 BRANCH(NEC) {
+                    // read chamber name and compare
                     READ NPATH AS CNAME;
                     TRIM [CNAME, NULL] CNAME;
                     STREQ [CNAME, TARGET] MATCH;
                     CLONE MATCH AS MC;
                     BRANCH(MC) {
+                        // found matching chamber
                         TEXT "" CID AS TARGET_CID;
                         IMPORT ALIVE FMARK;
                         BIFURCATE [FMARK, NULL] FOUND;
@@ -80,6 +95,7 @@ BRANCH(RCHECK) {
             }
         }
 
+        // if no chamber found with matching name, error out
         CLONE FOUND AS FC;
         BRANCH(!FC) {
             PRINT unknown chamber: $TARGET;
@@ -89,14 +105,14 @@ BRANCH(RCHECK) {
         TEXT ".ant/chambers/" TARGET_CID AS CDIR;
     }
 
-    // read current HEAD chamber manifest before switching
+    // read current HEAD chamber id before switching (for cleanup later)
     READ ".ant/HEAD" AS OLD_TNAME;
     TRIM [OLD_TNAME, NULL] OLD_TNAME;
     TEXT ".ant/refs/" OLD_TNAME AS OLD_REF;
     READ OLD_REF AS OLD_CID;
     TRIM [OLD_CID, NULL] OLD_CID;
 
-    // create ref at target chamber
+    // create new branch ref pointing at target chamber
     TEXT ".ant/refs/" NAME AS NEW_REF;
     WRITE TARGET_CID TO NEW_REF AS V;
 
@@ -109,15 +125,17 @@ BRANCH(RCHECK) {
 
     TEXT "\n" AS NL;
 
-    // restore working tree from target chamber
+    // restore working tree from target chamber blobs
     PARSE [TARGET_CID, NULL] CID_NUM;
     GT [CID_NUM, 0] HAS_CHAMBER;
     CLONE HAS_CHAMBER AS HC;
     BRANCH(HC) {
+        // read target chamber's manifest
         TEXT CDIR "/files" AS MPATH;
         READ MPATH AS MANIFEST;
         TRIM [MANIFEST, NULL] MANIFEST;
 
+        // write each blob to working tree
         SPLIT [MANIFEST, NL] FNAMES;
         IMPORT NUMBER 0 AS IDX;
 
@@ -125,19 +143,22 @@ BRANCH(RCHECK) {
             BIFURCATE FNAMES[FNAME, FNAMES];
             LENGTH [FNAME, NULL] FLEN;
             BRANCH(FLEN) {
+                // read blob from target chamber storage
                 TO_STRING [IDX, NULL] IDX_S;
                 TEXT CDIR "/" IDX_S AS BPATH;
                 READ BPATH AS CONTENT;
+                // write to working tree
                 WRITE CONTENT TO FNAME AS V4;
                 ADD [IDX, 1] IDX;
             }
         }
 
-        // remove files from old chamber that aren't in target
+        // best-effort cleanup: remove files from old chamber not in target
         PARSE [OLD_CID, NULL] OLD_NUM;
         GT [OLD_NUM, 0] HAD_OLD;
         CLONE HAD_OLD AS HOC;
         BRANCH(HOC) {
+            // read old chamber's manifest
             TEXT ".ant/chambers/" OLD_CID "/files" AS OLD_MPATH;
             READ OLD_MPATH AS OLD_MAN;
             TRIM [OLD_MAN, NULL] OLD_MAN;
@@ -147,9 +168,9 @@ BRANCH(RCHECK) {
                 BIFURCATE OLD_FILES[OFNAME, OLD_FILES];
                 LENGTH [OFNAME, NULL] OFLEN;
                 BRANCH(OFLEN) {
-                    // check if this file is in the target manifest
+                    // check if this old file exists in target manifest
                     SPLIT [MANIFEST, NL] CHECK_FILES;
-                    IMPORT ALIVE IN_TARGET;
+                    IMPORT ALIVE IN_TARGET;  // flag tracks if file found in target
                     IN_TARGET.DIE();
 
                     ~ATH(CHECK_FILES) {
@@ -157,6 +178,7 @@ BRANCH(RCHECK) {
                         STREQ [OFNAME, CFNAME] FMATCH;
                         CLONE FMATCH AS FMC;
                         BRANCH(FMC) {
+                            // found in target — mark flag
                             IMPORT ALIVE ITMARK;
                             BIFURCATE [ITMARK, NULL] IN_TARGET;
                         }
@@ -164,7 +186,8 @@ BRANCH(RCHECK) {
 
                     CLONE IN_TARGET AS ITC;
                     BRANCH(!ITC) {
-                        // file not in target — delete from working tree
+                        // file not in target — attempt deletion from working tree
+                        // (best-effort: READ kills the object, no real file deletion)
                         READ OFNAME AS DEAD_FILE;
                         DEAD_FILE.DIE();
                     }
@@ -177,14 +200,14 @@ BRANCH(RCHECK) {
     THIS.DIE();
 }
 
-// no chamber id — create branch at current HEAD's chamber
+// mode 2: name only — create branch at current HEAD chamber (no switch)
 READ ".ant/HEAD" AS CURRENT;
 TRIM [CURRENT, NULL] CURRENT;
 TEXT ".ant/refs/" CURRENT AS CUR_REF;
 READ CUR_REF AS CID;
 TRIM [CID, NULL] CID;
 
-// write chamber id to new ref
+// create new branch ref pointing at current HEAD's chamber
 TEXT ".ant/refs/" NAME AS NEW_REF;
 WRITE CID TO NEW_REF AS V;
 
